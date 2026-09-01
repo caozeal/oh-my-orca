@@ -168,3 +168,6 @@ tests/e2e/.cross-version-checkouts/
 # IS committed). Also keeps oxfmt/oxlint, which honor this file, from walking
 # vendored gems.
 /mobile/vendor/
+
+# Gradle build cache from Android builds of vendored mobile modules
+.gradle/
