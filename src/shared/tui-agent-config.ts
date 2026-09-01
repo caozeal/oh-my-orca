@@ -207,6 +207,13 @@ const TUI_AGENT_CONFIG_SOURCE: Record<TuiAgent, TuiAgentConfigSource> = {
     detectCmd: 'codebuff',
     promptInjectionMode: 'stdin-after-start'
   },
+  codebuddy: {
+    // Why: the npm package also installs `codebuddy-code` and `cbc` from the same bin.
+    detectCmd: 'codebuddy',
+    detectCmdAliases: ['codebuddy-code', 'cbc'],
+    // Why: CodeBuddy is a Claude Code fork, so `[prompt]` is a positional argv like Claude's.
+    promptInjectionMode: 'argv'
+  },
   'command-code': {
     // Why: use the full name (not its `cmd` alias) so detection doesn't collide with Windows' built-in cmd.exe.
     detectCmd: 'command-code',

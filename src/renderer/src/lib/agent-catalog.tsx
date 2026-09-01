@@ -221,6 +221,13 @@ export const getAgentCatalog = createLocalizedCatalog((): AgentCatalogEntry[] =>
     homepageUrl: 'https://www.codebuff.com/docs/help/quick-start'
   },
   {
+    id: 'codebuddy',
+    label: translate('auto.lib.agent.catalog.2ef6d882b1', 'CodeBuddy'),
+    cmd: 'codebuddy',
+    faviconDomain: 'www.codebuddy.ai',
+    homepageUrl: 'https://www.codebuddy.ai'
+  },
+  {
     id: 'command-code',
     label: translate('auto.lib.agent.catalog.6f8056a565', 'Command Code'),
     // Why: `npm i -g command-code` installs both `command-code` and the
