@@ -30,6 +30,9 @@ export type RuntimeStore = {
   removeProjectForHost?: Store['removeProjectForHost']
   reorderRepos?: Store['reorderRepos']
   getAllWorktreeMeta: Store['getAllWorktreeMeta']
+  captureNativeLocalWorktreeMetadataScanExpectation?: Store['captureNativeLocalWorktreeMetadataScanExpectation']
+  pruneSessionlessMissingLocalWorktreeMetadataForRepo?: Store['pruneSessionlessMissingLocalWorktreeMetadataForRepo']
+  getProfileStorageDirectory?: Store['getProfileStorageDirectory']
   getWorktreeMeta: Store['getWorktreeMeta']
   setWorktreeMeta: Store['setWorktreeMeta']
   setWorktreeMetaForHost?: Store['setWorktreeMetaForHost']
@@ -58,6 +61,7 @@ export type RuntimeStore = {
   automationOwnerPrecondition?: Store['automationOwnerPrecondition']
   automationChangeSelector?: Store['automationChangeSelector']
   listAutomationRuns?: Store['listAutomationRuns']
+  listAutomationRunsPage?: Store['listAutomationRunsPage']
   createAutomation?: Store['createAutomation']
   updateAutomation?: Store['updateAutomation']
   deleteAutomation?: Store['deleteAutomation']
@@ -108,6 +112,7 @@ export type RuntimeStore = {
     terminalHiddenDeliveryGate?: GlobalSettings['terminalHiddenDeliveryGate']
     terminalModelQueryAuthority?: GlobalSettings['terminalModelQueryAuthority']
     worktreeVisibilityDefaults?: GlobalSettings['worktreeVisibilityDefaults']
+    hostSettingOverrides?: GlobalSettings['hostSettingOverrides']
     agentSkillSharingEnabled?: GlobalSettings['agentSkillSharingEnabled']
   }
   // Why: narrow to `unknown` return so test mocks can return void without
