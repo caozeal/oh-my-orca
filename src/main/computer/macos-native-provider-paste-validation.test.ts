@@ -6,22 +6,25 @@ const {
   chmodSyncMock,
   connectMacOSProviderSocketMock,
   mkdtempSyncMock,
-  resolveMacOSComputerUseExecutablePathMock,
+  resolveMacOSComputerUseAppPathMock,
   rmSyncMock,
   spawnMock,
+  spawnSyncMock,
   writeFileSyncMock
 } = vi.hoisted(() => ({
   chmodSyncMock: vi.fn(),
   connectMacOSProviderSocketMock: vi.fn(),
   mkdtempSyncMock: vi.fn(),
-  resolveMacOSComputerUseExecutablePathMock: vi.fn(),
+  resolveMacOSComputerUseAppPathMock: vi.fn(),
   rmSyncMock: vi.fn(),
   spawnMock: vi.fn(),
+  spawnSyncMock: vi.fn(),
   writeFileSyncMock: vi.fn()
 }))
 
 vi.mock('child_process', () => ({
-  spawn: spawnMock
+  spawn: spawnMock,
+  spawnSync: spawnSyncMock
 }))
 
 vi.mock('fs', () => ({
@@ -32,7 +35,7 @@ vi.mock('fs', () => ({
 }))
 
 vi.mock('./macos-native-provider-paths', () => ({
-  resolveMacOSComputerUseExecutablePath: resolveMacOSComputerUseExecutablePathMock
+  resolveMacOSComputerUseAppPath: resolveMacOSComputerUseAppPathMock
 }))
 
 vi.mock('./macos-native-provider-socket', () => ({
@@ -62,7 +65,7 @@ class FakeSocket extends EventEmitter {
 }
 
 class FakeProvider extends EventEmitter {
-  kill = vi.fn()
+  stderr = null
   unref = vi.fn()
 }
 
@@ -94,14 +97,13 @@ describe('MacOSNativeProviderClient paste validation', () => {
     sockets.length = 0
     providers.length = 0
     mkdtempSyncMock.mockImplementation((prefix: string) => `${prefix}${sockets.length}`)
-    resolveMacOSComputerUseExecutablePathMock.mockReturnValue(
-      '/Applications/Orca Computer Use.app/Contents/MacOS/orca-computer-use-macos'
-    )
+    resolveMacOSComputerUseAppPathMock.mockReturnValue('/Applications/Orca Computer Use.app')
     spawnMock.mockImplementation(() => {
       const provider = new FakeProvider()
       providers.push(provider)
       return provider
     })
+    spawnSyncMock.mockReturnValue({ status: 0 })
     connectMacOSProviderSocketMock.mockImplementation(async () => {
       const socket = new FakeSocket()
       sockets.push(socket)
@@ -113,9 +115,10 @@ describe('MacOSNativeProviderClient paste validation', () => {
     chmodSyncMock.mockReset()
     connectMacOSProviderSocketMock.mockReset()
     mkdtempSyncMock.mockReset()
-    resolveMacOSComputerUseExecutablePathMock.mockReset()
+    resolveMacOSComputerUseAppPathMock.mockReset()
     rmSyncMock.mockReset()
     spawnMock.mockReset()
+    spawnSyncMock.mockReset()
     writeFileSyncMock.mockReset()
     vi.useRealTimers()
   })
