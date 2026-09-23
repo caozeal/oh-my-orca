@@ -4,6 +4,7 @@ import {
   normalizePromptField
 } from './agent-status-field-normalization'
 import type { AgentJournalRenderItem, AgentJournalSubmission } from './agent-session-journal-types'
+import { isRootAgentJournalItem } from './agent-session-journal-producer'
 import {
   AGENT_STATUS_TOOL_INPUT_MAX_LENGTH,
   AGENT_STATUS_TOOL_NAME_MAX_LENGTH
@@ -20,7 +21,8 @@ import { sha256 } from './sha256'
 // Re-exported so the live-turn readers' existing consumers keep one import site.
 export {
   activeStructuredAgentSessionToolCall,
-  activeStructuredAgentSessionTurnId
+  activeStructuredAgentSessionTurnId,
+  newestStructuredAgentSessionTurn
 } from './structured-agent-session-live-turn'
 
 function boundedText(payload: { head: string; truncated: boolean; byteLength: number }): string {
@@ -134,13 +136,21 @@ function itemBlocks(item: AgentJournalRenderItem): {
 
 const projectedItems = new WeakMap<AgentJournalRenderItem, NativeChatMessage | null>()
 
+/** Deliberately NOT scoped by producer: the transcript shows every agent's
+ *  output. The line this module draws is that the transcript renders every item,
+ *  while every "what is this agent doing right now" scan renders only the
+ *  session's own agent's. */
 export function projectStructuredItemsToNativeChat(
   items: readonly AgentJournalRenderItem[]
 ): NativeChatMessage[] {
-  return items.flatMap((item) => {
+  const messages: NativeChatMessage[] = []
+  items.forEach((item) => {
     const projected = projectStructuredItemToNativeChat(item)
-    return projected ? [projected] : []
+    if (projected) {
+      messages.push(projected)
+    }
   })
+  return messages
 }
 
 export function projectStructuredItemToNativeChat(
@@ -165,6 +175,9 @@ export function projectStructuredItemToNativeChat(
   return message
 }
 
+/** Deliberately NOT scoped by producer: this is an existence test ("is this
+ *  session listable at all"), not an attribution one. A session whose only
+ *  content came from a subagent still has content. */
 export function hasPersistedStructuredAgentSessionTurn(
   items: readonly AgentJournalRenderItem[]
 ): boolean {
@@ -231,26 +244,46 @@ function messageProse(blocks: readonly NativeChatBlock[]): string {
   return blocks.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join('\n')
 }
 
-/** The newest user prompt, as the sidebar quotes it. */
+/** The newest prompt the session's own user turn carries, as the sidebar quotes
+ *  it. Scoped to root rows for the same reason the assistant line is: a provider
+ *  that journals a subagent's own prompt would otherwise requote it as the
+ *  session's. */
 export function latestStructuredAgentSessionPrompt(
   items: readonly AgentJournalRenderItem[]
 ): string {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const body = items[index]?.body
-    if (body?.kind === 'message' && body.role === 'user') {
-      return messageProse(body.blocks)
-    }
-  }
-  return ''
+  const body = latestStructuredAgentSessionUserItem(items)?.body
+  return body?.kind === 'message' ? messageProse(body.blocks) : ''
 }
 
-/** The newest assistant prose in the latest user turn. Tool-only assistant items
- *  are skipped; the user boundary clears prose from the preceding turn. */
+export function latestStructuredAgentSessionUserItem(
+  items: readonly AgentJournalRenderItem[]
+): AgentJournalRenderItem | null {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]
+    if (
+      item?.body.kind === 'message' &&
+      item.body.role === 'user' &&
+      isRootAgentJournalItem(item)
+    ) {
+      return item
+    }
+  }
+  return null
+}
+
+/** The newest prose THE SESSION'S OWN AGENT wrote in the latest user turn — not a
+ *  subagent's, whose rows share this journal and are usually the newer ones while
+ *  a child runs. Tool-only assistant items are skipped; the user boundary clears
+ *  prose from the preceding turn. */
 export function latestStructuredAgentSessionAssistantMessage(
   items: readonly AgentJournalRenderItem[]
 ): string {
   for (let index = items.length - 1; index >= 0; index -= 1) {
-    const body = items[index]?.body
+    const item = items[index]
+    const body = item?.body
+    if (!isRootAgentJournalItem(item)) {
+      continue
+    }
     if (body?.kind === 'message' && body.role === 'user') {
       return ''
     }
@@ -317,14 +350,6 @@ export function projectStructuredAgentSessionStatusSummary(
     ...(toolInput ? { toolInput } : {}),
     ...(lastAssistantMessage ? { lastAssistantMessage } : {})
   }
-}
-
-/** The agent-status state one projected session status stands for. Shared across the process
- *  boundary so `worktree ps` and the sidebar cannot disagree about the same session. */
-export function structuredAgentSessionStatusState(
-  status: StructuredAgentSessionProjectedStatus
-): 'working' | 'blocked' | 'done' {
-  return status === 'working' ? 'working' : status === 'attention' ? 'blocked' : 'done'
 }
 
 export function structuredAgentSessionPaneKey(tabId: string, sessionId: string): string {

@@ -30,6 +30,7 @@ export const MOBILE_AGENT_ICON_ASSETS: Partial<Record<TuiAgent, ImageSourcePropT
   cline: require('../../../src/shared/agent-icons/cline.png'),
   codebuff: require('../../../src/shared/agent-icons/codebuff.png'),
   codebuddy: require('../../../src/shared/agent-icons/codebuddy.png'),
+  freebuff: require('../../../src/shared/agent-icons/freebuff.png'),
   'command-code': require('../../../src/shared/agent-icons/command-code.png'),
   continue: require('../../../src/shared/agent-icons/continue.png'),
   cursor: require('../../../src/shared/agent-icons/cursor.png'),
@@ -40,5 +41,6 @@ export const MOBILE_AGENT_ICON_ASSETS: Partial<Record<TuiAgent, ImageSourcePropT
   rovo: require('../../../src/shared/agent-icons/rovo.png'),
   hermes: require('../../../src/shared/agent-icons/hermes.png'),
   devin: require('../../../src/shared/agent-icons/devin.png'),
+  muse: require('../../../src/shared/agent-icons/muse.png'),
   openclaw: require('../../../src/shared/agent-icons/openclaw.png')
 }

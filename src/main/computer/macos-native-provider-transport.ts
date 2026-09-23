@@ -5,6 +5,10 @@ import { release, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { connectMacOSProviderSocket } from './macos-native-provider-socket'
+import {
+  reapMacOSProviderProcess,
+  type MacOSProviderProcessOwner
+} from './macos-native-provider-process-reaping'
 import { RuntimeClientError } from './runtime-client-error'
 
 const HELPER_CONNECT_TIMEOUT_MS = 10_000
@@ -46,6 +50,27 @@ export function attachMacOSNativeProviderSocketListeners(
   }
 }
 
+export class NativeProviderLineBuffer {
+  private pending = ''
+  private hasCompleteLine = false
+
+  push(chunk: string, handleLine: (line: string) => void): void {
+    this.pending += chunk
+    this.hasCompleteLine ||= chunk.endsWith('\n') || chunk.includes('\n')
+    if (!this.hasCompleteLine) {
+      return
+    }
+    // Keep complete lines retryable if a callback throws.
+    this.pending = consumeNativeProviderLines(this.pending, handleLine)
+    this.hasCompleteLine = false
+  }
+
+  clear(): void {
+    this.pending = ''
+    this.hasCompleteLine = false
+  }
+}
+
 export function consumeNativeProviderLines(
   buffer: string,
   handleLine: (line: string) => void
@@ -66,10 +91,12 @@ export function consumeNativeProviderLines(
 
 export async function startMacOSNativeProviderSocket({
   helperAppPath,
-  isCurrent
+  isCurrent,
+  providerProcess
 }: {
   helperAppPath: string
   isCurrent: (socketPath: string) => boolean
+  providerProcess: MacOSProviderProcessOwner
 }): Promise<StartedMacOSProviderSocket> {
   const socketDirectory = mkdtempSync(join(tmpdir(), 'orca-computer-use-'))
   chmodSync(socketDirectory, 0o700)
@@ -82,6 +109,9 @@ export async function startMacOSNativeProviderSocket({
   // app — as the Accessibility client, so the helper's own grant is never read
   // and every accessibility call is denied.
   const provider = spawnProvider(helperAppPath, socketPath, socketTokenPath)
+  // Why: own the launch from birth. Adopting only after connect leaves a window
+  // where a quit during startup strands it with nobody holding the handle.
+  providerProcess.adopt(provider)
   const providerFailure = waitForProviderLaunchFailure(provider)
   const connectAbort = new AbortController()
   try {
@@ -93,7 +123,6 @@ export async function startMacOSNativeProviderSocket({
     rmSync(socketTokenPath, { force: true })
     if (!isCurrent(socketPath)) {
       socket.destroy()
-      cleanupSocketDirectory(socketDirectory)
       throw new RuntimeClientError(
         'accessibility_error',
         'native macOS provider startup was superseded'
@@ -106,11 +135,12 @@ export async function startMacOSNativeProviderSocket({
     // Why: `open` exits once LaunchServices owns the app, so the helper is left
     // as a launchd child and this socket path is the only handle on it.
     stopProviderForSocket(socketPath)
-    const failure = withProviderStartupHint(error, socketPath, providerFailure.stderr)
-    if (isCurrent(socketPath)) {
-      cleanupSocketDirectory(socketDirectory)
-    }
-    throw failure
+    // Why: escalate on the spawned handle too, so an `open` wedged past spawn
+    // cannot outlive the failed attempt.
+    reapMacOSProviderProcess(provider)
+    // Each attempt owns a unique directory, even after its generation is superseded.
+    cleanupSocketDirectory(socketDirectory)
+    throw withProviderStartupHint(error, socketPath, providerFailure.stderr)
   }
 }
 

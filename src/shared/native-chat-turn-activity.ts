@@ -1,18 +1,26 @@
 import { readAgentJournalTurn } from './agent-session-turn-record'
 import type { AgentJournalRenderItem } from './agent-session-journal-types'
 import type { AgentSessionTurnActivity } from './agent-session-wire'
+import { isRootAgentJournalItem } from './agent-session-journal-producer'
 import { normalizePromptField } from './agent-status-field-normalization'
 import { describeActiveToolCall, formatActiveToolLabel } from './native-chat-tool-activity'
 
 export type NativeChatTurnActivity = { kind: 'description'; text: string }
 
 function activityLine(text: string): string | null {
-  const lines = text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const latest = lines.at(-1)
-  return latest ? normalizePromptField(latest) || null : null
+  let end = text.length
+  while (end > 0) {
+    const start = text.lastIndexOf('\n', end - 1) + 1
+    const latest = text.slice(start, end).trim()
+    if (latest) {
+      return normalizePromptField(latest) || null
+    }
+    if (start === 0) {
+      break
+    }
+    end = start - 1
+  }
+  return null
 }
 
 function recentToolActivityLabels(items: readonly AgentJournalRenderItem[]): Set<string> {
@@ -79,7 +87,11 @@ export function selectStructuredAgentTurnActivity(
     const turn = readAgentJournalTurn(item.body)
     return turn?.turnId === turnId && turn.state === 'running'
   })
-  const turnItems = items.slice(Math.max(0, turnStartIndex))
+  // Scoped ONCE, for everything below: this answers what the session's own agent
+  // is doing. Both readers below consult the label set, so a subagent left in it
+  // would let a child's tool label suppress the parent's own activity line —
+  // child data deciding what the parent's surface shows.
+  const turnItems = items.slice(Math.max(0, turnStartIndex)).filter(isRootAgentJournalItem)
   const toolLabels = recentToolActivityLabels(turnItems)
   if (providerActivity?.turnId === turnId) {
     const text = activityLine(providerActivity.text)

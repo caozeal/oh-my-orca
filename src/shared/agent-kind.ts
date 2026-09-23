@@ -20,6 +20,7 @@ const TUI_AGENT_KIND_BY_AGENT = {
   codex: 'codex',
   autohand: 'autohand',
   opencode: 'opencode',
+  opencode2: 'opencode2',
   'mimo-code': 'mimo-code',
   pi: 'pi',
   omp: 'omp',
@@ -36,6 +37,7 @@ const TUI_AGENT_KIND_BY_AGENT = {
   cline: 'cline',
   codebuff: 'codebuff',
   codebuddy: 'codebuddy',
+  freebuff: 'freebuff',
   'command-code': 'command-code',
   continue: 'continue',
   cursor: 'cursor',
@@ -50,7 +52,8 @@ const TUI_AGENT_KIND_BY_AGENT = {
   grok: 'grok',
   devin: 'devin',
   ante: 'ante',
-  trae: 'trae'
+  trae: 'trae',
+  muse: 'muse'
 } satisfies Record<TuiAgent, ConcreteAgentKind>
 
 // Why: `satisfies Record<TuiAgent, …>` makes the lookup exhaustive at compile

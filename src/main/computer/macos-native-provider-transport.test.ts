@@ -49,7 +49,15 @@ class FakeStderr extends EventEmitter {
 
 class FakeProvider extends EventEmitter {
   stderr = new FakeStderr()
+  exitCode: number | null = null
+  signalCode: string | null = null
   unref = vi.fn()
+  // Why: settle synchronously so the reaper's SIGKILL escalation never outlives the test.
+  kill = vi.fn((signal: NodeJS.Signals) => {
+    this.signalCode = signal
+    this.emit('exit', null, signal)
+    return true
+  })
 }
 
 type StartProvider = (options: {
@@ -66,13 +74,23 @@ type TransportHarness = {
 // its errors from the same registry or the instanceof check cannot hold.
 async function loadHarness(): Promise<TransportHarness> {
   vi.resetModules()
-  const [{ startMacOSNativeProviderSocket }, { RuntimeClientError: RuntimeError }] =
-    await Promise.all([
-      import('./macos-native-provider-transport'),
-      import('./runtime-client-error')
-    ])
+  const [
+    { startMacOSNativeProviderSocket },
+    { RuntimeClientError: RuntimeError },
+    { MacOSProviderProcessOwner }
+  ] = await Promise.all([
+    import('./macos-native-provider-transport'),
+    import('./runtime-client-error'),
+    import('./macos-native-provider-process-reaping')
+  ])
   return {
-    start: startMacOSNativeProviderSocket,
+    // Why: every attempt brings its own owner; the tests exercise the transport,
+    // not the adoption lifecycle.
+    start: (options) =>
+      startMacOSNativeProviderSocket({
+        ...options,
+        providerProcess: new MacOSProviderProcessOwner()
+      }),
     stalledSocket: new RuntimeError(
       'action_timeout',
       'native macOS helper app did not open its socket: connect ENOENT'
