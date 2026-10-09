@@ -213,17 +213,16 @@ export type MobileWebShellSessionEvent =
   /** The native view finished a document. Unstamped, like the view's failure and for the same
    *  reason: the view exists only under the generation on screen. */
   | { readonly type: 'document-loaded' }
-  /**
-   * The page said `ready` over the bridge, which is the only proof its code ran at all, carrying
-   * what that `ready` declared it reports.
-   */
-  | { readonly type: 'page-ready'; readonly reports: readonly string[] }
-  /** The page has a frame on screen. Only a page that declared it ever sends one. */
+  /** The page said `ready` over the bridge, which is the only proof its code ran at all. */
+  | { readonly type: 'page-ready' }
+  /** The page has a frame on screen. */
   | { readonly type: 'page-painted' }
   /** The page is holding the device Back key, or has let it go. The host sends false on its own
    *  for every way a document ends, so this never has to be inferred from silence. */
   | { readonly type: 'page-back-claim'; readonly claimed: boolean }
   | { readonly type: 'page-ready-deadline'; readonly flow: number }
+  /** The window crossed the wide-layout threshold. */
+  | { readonly type: 'layout-changed'; readonly wide: boolean }
 
 /** Latches live beside the state because both outlive the state they were set in: `retriedOnce`
  *  spans the delete-and-refetch that puts the state back to `checking`, and `remountedOnce` spans a
@@ -231,6 +230,12 @@ export type MobileWebShellSessionEvent =
 export type MobileWebShellSession = {
   /** The concrete route this session was opened for, matched against what the bundle lists. */
   readonly routePathname: string
+  /** A wide layout: served only under `canOwnHostArea`; the host route gets every route's grants. */
+  readonly wide: boolean
+  /** The route list the view below was built from, so a layout-class change can rebuild it. */
+  readonly routes: readonly MobileWebPageRoute[] | undefined
+  /** This session owns the wide host area: the page draws the sidebar. */
+  readonly ownsHostArea: boolean
   /** Every route pattern this shell would render from the page, as the bundle in hand declares
    *  them. The page is told, so it keeps a navigation into one of them instead of handing it back. */
   readonly pageRoutes: readonly string[]
@@ -246,9 +251,6 @@ export type MobileWebShellSession = {
   /** Whether the document on screen has spoken over the bridge. Cleared by every new document,
    *  because each one has to prove itself: the last one's word says nothing about this one. */
   readonly pageReady: boolean
-  /** Whether this document said it would report its first paint. Cleared with `pageReady`, and
-   *  false for every page built before the report existed. */
-  readonly pageReportsPaint: boolean
   /** Whether this document has reported a frame on screen. Cleared with `pageReady`. */
   readonly pagePainted: boolean
   /**

@@ -35,32 +35,12 @@ const session: NativeChatLiveSession = {
   agent: 'codex',
   hasMore: false,
   loadingEarlier: false,
+  olderHistoryGeneration: 0,
   loadEarlier: vi.fn(),
   readPhase: 'ready'
 }
 
 describe('NativeChatMessageList assistant messages', () => {
-  it('keeps prose selectable and places non-selectable controls after it', () => {
-    render(
-      <NativeChatMessageList
-        session={session}
-        isWorking={false}
-        expandSignal={false}
-        fontScale={1}
-      />
-    )
-
-    const prose = screen.getByText('Selectable agent response.')
-    const row = prose.closest('.group')
-    const copyButton = screen.getByRole('button', { name: 'Copy message' })
-    const controls = copyButton.parentElement
-
-    expect(row).toHaveClass('select-text')
-    expect(controls).toHaveClass('select-none', 'can-hover:pointer-events-none', 'mt-1')
-    expect(controls).not.toHaveClass('absolute')
-    expect(prose.compareDocumentPosition(controls!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
-  })
-
   it('keeps a running tool live when transcript lifecycle metadata is absent', () => {
     render(
       <NativeChatMessageList
@@ -86,13 +66,58 @@ describe('NativeChatMessageList assistant messages', () => {
         }}
         isWorking
         expandSignal={false}
-        fontScale={1}
       />
     )
 
-    expect(screen.getByText('Running sleep 5')).toBeInTheDocument()
+    expect(screen.getByText('Running 1 command')).toBeInTheDocument()
+    expect(screen.getByText('sleep 5')).toBeInTheDocument()
     expect(screen.queryByText('1×')).toBeNull()
     expect(document.querySelector('.text-destructive')).toBeNull()
+  })
+
+  // Only the turn's trailing run is live. Once the agent has said something
+  // after it, that run is done whatever its last call still reports; a
+  // reasoning aside is not "after it" — the agent is still inside the batch.
+  it('settles a run once prose follows it, but not for a reasoning aside', () => {
+    const run = {
+      id: 'assistant-tool-1',
+      role: 'assistant' as const,
+      blocks: [
+        {
+          type: 'tool-call' as const,
+          name: 'shell',
+          input: { command: 'sleep 5' },
+          state: 'running' as const
+        }
+      ],
+      timestamp: 1,
+      source: 'transcript' as const
+    }
+    const after = (role: 'assistant' | 'reasoning') => ({
+      id: `after-${role}`,
+      role,
+      blocks: [{ type: 'text' as const, text: 'Looking at the output.' }],
+      timestamp: 2,
+      source: 'transcript' as const
+    })
+    const { rerender } = render(
+      <NativeChatMessageList
+        session={{ ...session, status: 'working', messages: [run, after('reasoning')] }}
+        isWorking
+        expandSignal={false}
+      />
+    )
+    expect(screen.getByText('Running 1 command')).toBeInTheDocument()
+
+    rerender(
+      <NativeChatMessageList
+        session={{ ...session, status: 'working', messages: [run, after('assistant')] }}
+        isWorking
+        expandSignal={false}
+      />
+    )
+    expect(screen.queryByText('Running 1 command')).toBeNull()
+    expect(screen.getByText('sleep 5')).toBeInTheDocument()
   })
 
   it('keeps the current tool live when a stale completed lifecycle meets active hook state', () => {
@@ -121,11 +146,11 @@ describe('NativeChatMessageList assistant messages', () => {
         }}
         isWorking
         expandSignal={false}
-        fontScale={1}
       />
     )
 
-    expect(screen.getByText('Running sleep 5')).toBeInTheDocument()
+    expect(screen.getByText('Running 1 command')).toBeInTheDocument()
+    expect(screen.getByText('sleep 5')).toBeInTheDocument()
   })
 })
 
@@ -200,7 +225,6 @@ describe('NativeChatMessageList spawn-group roster', () => {
         isWorking={false}
         workingStartedAt={startedAt}
         expandSignal={false}
-        fontScale={1}
       />
     )
 
@@ -242,7 +266,6 @@ describe('NativeChatMessageList spawn-group roster', () => {
         isWorking={false}
         workingStartedAt={startedAt}
         expandSignal={false}
-        fontScale={1}
       />
     )
 
@@ -262,7 +285,6 @@ describe('NativeChatMessageList spawn-group roster', () => {
         isWorking={false}
         workingStartedAt={startedAt}
         expandSignal={false}
-        fontScale={1}
       />
     )
 
@@ -290,7 +312,6 @@ describe('NativeChatMessageList spawn-group roster', () => {
         isWorking
         workingStartedAt={Date.now()}
         expandSignal={false}
-        fontScale={1}
       />
     )
 
@@ -333,7 +354,6 @@ describe('NativeChatMessageList spawn-group roster', () => {
         isWorking
         workingStartedAt={startedAt + 3}
         expandSignal={false}
-        fontScale={1}
       />
     )
 
@@ -371,7 +391,7 @@ describe('NativeChatMessageList childless spawn group', () => {
 
   /** Every slot the transcript column lays out — one per row that mounted. */
   function emptySlots(container: HTMLElement): Element[] {
-    const column = container.querySelector('.max-w-4xl')
+    const column = container.querySelector('[data-native-chat-transcript-column]')
     expect(column).not.toBeNull()
     return Array.from(column!.children).filter((slot) => slot.textContent === '')
   }
@@ -387,7 +407,6 @@ describe('NativeChatMessageList childless spawn group', () => {
         isWorking={false}
         workingStartedAt={startedAt}
         expandSignal={false}
-        fontScale={1}
       />
     )
 
@@ -409,7 +428,6 @@ describe('NativeChatMessageList childless spawn group', () => {
         isWorking={false}
         workingStartedAt={startedAt}
         expandSignal={false}
-        fontScale={1}
       />
     )
 

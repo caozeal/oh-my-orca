@@ -1,12 +1,19 @@
 import { describe, expect, it } from 'vitest'
-import { AGENT_SESSION_JOURNAL_SCHEMA_VERSION } from '../../../shared/agent-session-journal-types'
+import {
+  AGENT_JOURNAL_THREAD_SCOPE,
+  AGENT_SESSION_JOURNAL_SCHEMA_VERSION
+} from '../../../shared/agent-session-journal-types'
 import {
   MAX_JOURNAL_LIFECYCLE_BATCH_MUTATIONS,
   parseJournalRow,
   type JournalRow
 } from './journal-row-schema'
-import { createJournalReducerState } from './journal-reducer'
-import { buildJournalItemRow } from './journal-row-builders'
+import { applyJournalRow, createJournalReducerState } from './journal-reducer'
+import {
+  buildJournalItemRow,
+  journalLifecycleBatchRowBuilder,
+  type JournalLifecycleMutationInput
+} from './journal-row-builders'
 
 const BASE = { v: 1, epoch: 'epoch-1', seq: 1, fence: 1, ts: 1 }
 
@@ -273,7 +280,8 @@ describe('producer linkage on the persisted row', () => {
       seq: 1,
       fence: 1,
       ts: 1_700_000_000_000,
-      ...(withLinkage ? { linkage } : {})
+      ...(withLinkage ? { linkage } : {}),
+      turnScope: AGENT_JOURNAL_THREAD_SCOPE
     })
     const parsed = parseJournalRow(JSON.stringify(row))
     return parsed.ok ? parsed.row : null
@@ -282,8 +290,8 @@ describe('producer linkage on the persisted row', () => {
   it('writes and reads the bundle back without bumping the schema version', () => {
     const row = roundTrip(true)
     expect(row).toMatchObject(linkage)
-    // Deliberately NOT a version bump: an unknown `v` is unreadable and latches
-    // the host read-only, while an unknown KEY is simply ignored by an older host.
+    // Deliberately NOT a version bump: an unknown `v` is unreadable and costs an older
+    // host the chat, while an unknown KEY is simply ignored by an older host.
     expect(row?.v).toBe(AGENT_SESSION_JOURNAL_SCHEMA_VERSION)
   })
 
@@ -342,6 +350,59 @@ describe('producer linkage on the persisted row', () => {
     })
   })
 
+  it('round-trips a batch mutation that names its own producer, with no version bump', () => {
+    const state = createJournalReducerState('session-1', 'epoch-1')
+    const own = {
+      kind: 'item' as const,
+      identity: { ...identity, uuid: 'u-own' },
+      body,
+      turnScope: AGENT_JOURNAL_THREAD_SCOPE
+    }
+    const build = (child: JournalLifecycleMutationInput) =>
+      journalLifecycleBatchRowBuilder(() => state, 'settle-1', [child, own], { fence: 1 })(1, 1)
+    const row = build({
+      kind: 'item',
+      identity,
+      body,
+      linkage,
+      turnScope: AGENT_JOURNAL_THREAD_SCOPE
+    })
+
+    const parsed = parseJournalRow(JSON.stringify(row))
+    const mutations = parsed.ok && parsed.row.kind === 'lifecycle-batch' ? parsed.row.mutations : []
+    expect(mutations[0]).toMatchObject(linkage)
+    expect(mutations[1] && 'agentId' in mutations[1]).toBe(false)
+    // The same batch without the stamp writes the same version: an older host
+    // ignores the unknown keys rather than losing the chat to an unknown `v`.
+    expect(row.v).toBe(
+      build({ kind: 'item', identity, body, turnScope: AGENT_JOURNAL_THREAD_SCOPE }).v
+    )
+  })
+
+  it('keeps a batch mutation but drops its unusable producer id', () => {
+    // Same policy as the row base: sanitize, never reject — a rejected batch
+    // would take every mutation in it out of the timeline.
+    const parsed = parseJournalRow(
+      JSON.stringify({
+        v: AGENT_SESSION_JOURNAL_SCHEMA_VERSION,
+        epoch: 'epoch-1',
+        seq: 7,
+        fence: 1,
+        ts: 1_700_000_000_000,
+        kind: 'lifecycle-batch',
+        settlementId: 'settle-2',
+        mutations: [
+          { kind: 'item', itemId: 'i-1', revision: 1, body, agentId: '' },
+          { kind: 'item', itemId: 'i-2', revision: 1, body, agentId: 'thread-child' }
+        ]
+      })
+    )
+    const mutations = parsed.ok && parsed.row.kind === 'lifecycle-batch' ? parsed.row.mutations : []
+    expect(mutations).toHaveLength(2)
+    expect(mutations[0] && 'agentId' in mutations[0]).toBe(false)
+    expect(mutations[1]).toMatchObject({ agentId: 'thread-child' })
+  })
+
   it("omits every key on a row the session's own agent produced", () => {
     const row = roundTrip(false)
     expect(row && 'agentId' in row).toBe(false)
@@ -360,7 +421,7 @@ describe('producer linkage on the persisted row', () => {
     expect(parsed.ok && 'agentId' in parsed.row).toBe(false)
   })
 
-  it('leaves a strict prompt shape able to parse, because linkage rides the row', () => {
+  it('parses a prompt shape with linkage on the row', () => {
     const question = {
       ...BASE,
       v: 3,
@@ -379,10 +440,9 @@ describe('producer linkage on the persisted row', () => {
     expect(parsed.ok).toBe(true)
   })
 
-  it('rejects the same row when linkage is put INSIDE the strict shape', () => {
-    // The positive control for the test above: proof the strictness it avoids is
-    // real, rather than the row parsing for some unrelated reason. This is why
-    // the bundle rides the row base and never a body.
+  it('reads the same row with linkage put INSIDE a prompt option, ignoring the key there', () => {
+    // Older builds read prompt options strictly and dropped the journal from such a row, which is
+    // why the bundle rides the row base and never a body. This build ignores and keeps the key.
     const smuggled = {
       ...BASE,
       v: 3,
@@ -396,6 +456,69 @@ describe('producer linkage on the persisted row', () => {
         resolution
       }
     }
-    expect(parseJournalRow(JSON.stringify(smuggled)).ok).toBe(false)
+    const parsed = parseJournalRow(JSON.stringify(smuggled))
+    expect(parsed.ok && parsed.row.kind === 'item' && parsed.row.body).toEqual(smuggled.body)
+    expect(parsed.ok && 'agentId' in parsed.row).toBe(false)
   })
+})
+
+describe('journal revision admission', () => {
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 1, 1e100])(
+    'uses the same integer rule for revision %s in rows and nested mutations',
+    (revision) => {
+      for (const kind of ['item', 'tombstone'] as const) {
+        const mutation = {
+          kind,
+          itemId: 'old',
+          revision,
+          ...(kind === 'item' ? { body: { kind: 'status', text: 'x' } } : {})
+        }
+        expect(parseJournalRow(JSON.stringify({ ...BASE, ...mutation })).ok).toBe(
+          Number.isInteger(revision)
+        )
+        expect(
+          parseJournalRow(
+            JSON.stringify({
+              ...BASE,
+              kind: 'lifecycle-batch',
+              settlementId: 'end',
+              mutations: [mutation]
+            })
+          ).ok
+        ).toBe(Number.isInteger(revision))
+      }
+    }
+  )
+})
+
+it('preserves stored keys and reducer aliases across an item revision and a tombstone', () => {
+  const state = createJournalReducerState('session-1', 'epoch-1')
+  state.aliases.set('provider:opaque%ZZ', 'canonical')
+  state.tombstones.set('canonical', 7)
+  const row = buildJournalItemRow({
+    state,
+    itemId: 'provider:opaque%ZZ',
+    body: { kind: 'status', text: 'ended' },
+    seq: 1,
+    fence: 1,
+    ts: 1,
+    turnScope: AGENT_JOURNAL_THREAD_SCOPE
+  })
+  expect(row).toMatchObject({ itemId: 'provider:opaque%ZZ', revision: 8 })
+  expect(parseJournalRow(JSON.stringify(row)).ok).toBe(true)
+  applyJournalRow(state, row)
+  expect([...state.items.keys()]).toEqual(['canonical'])
+  const removed = journalLifecycleBatchRowBuilder(
+    () => state,
+    'remove',
+    [{ kind: 'tombstone', itemId: 'provider:opaque%ZZ' }],
+    { fence: 1 }
+  )(2, 1)
+  expect(removed.mutations).toEqual([
+    { kind: 'tombstone', itemId: 'provider:opaque%ZZ', revision: 9 }
+  ])
+  expect(parseJournalRow(JSON.stringify(removed)).ok).toBe(true)
+  applyJournalRow(state, removed)
+  expect(state.items.size).toBe(0)
+  expect(state.tombstones.get('canonical')).toBe(9)
 })

@@ -5,10 +5,8 @@ import { OrchestrationError } from '../../../../orchestration/orchestration-erro
 import { parseWorkerTerminalHostScope } from '../../../../orchestration/worker-terminal-process-liveness'
 import type { OrchestrationFleetWorker } from '../../../../../../shared/orchestration-fleet-projection'
 import { projectWorkerFleet } from './worker-list-projection'
-import {
-  observeStructuredWorker,
-  resolveStructuredWorkerForDispatch
-} from '../../orchestration-structured-worker-lifecycle'
+import { observeChatAssignee } from '../../../../orchestration/chat-assignee'
+import { inspectSessionWorker } from './session-worker-observation'
 import type {
   DispatchContextRow,
   FederatedDispatchRow,
@@ -28,6 +26,9 @@ export async function inspectWorkerTerminal(
   reason?: string
   /** Set only on a proven-exact worker parked on a prompt that needs a human. */
   agentWait?: RuntimeTerminalInteractiveWait | null
+  /** Structured workers only: whether mail still reaches it — at rest included, since the mail
+   *  starts it. Absent when ownership cannot be read. `status` stays the process verdict. */
+  addressable?: boolean
   /** The handle that actually resolved: the durable one, or a live handle re-minted from the
    *  recorded process incarnation after the durable handle went stale. Null when none resolved. */
   terminalHandle: string | null
@@ -38,28 +39,9 @@ export async function inspectWorkerTerminal(
   if (!terminalHandle) {
     return { terminal: null, exact: false, status: 'unattached', terminalHandle: null }
   }
-  const structured = resolveStructuredWorkerForDispatch(db, dispatchId)
-  if (structured) {
-    // Exactness is the recorded pane and lineage, which the runtime getters answer from the
-    // structured registry; there is no terminal to show.
-    //
-    // `agentWait` is deliberately ABSENT rather than null. Null is the contract's "Orca looked and
-    // found no wait", and nothing here looks: a structured worker parks on a journal question item,
-    // which no terminal prompt scan can see. Reporting null would tell a coordinator the worker is
-    // not waiting, which is the one thing the field's own documentation forbids inferring.
-    const exact = db.isDispatchProcessCurrent({
-      dispatchId,
-      paneKey: structured.paneKey,
-      processIncarnation: structured.processIncarnation
-    })
-    const observation = observeStructuredWorker(structured)
-    return {
-      terminal: null,
-      exact,
-      status: exact ? observation.status : 'identity_changed',
-      ...(exact && observation.reason ? { reason: observation.reason } : {}),
-      terminalHandle: null
-    }
+  const session = await inspectSessionWorker(runtime, db, dispatchId, terminalHandle)
+  if (session) {
+    return session
   }
   let effectiveHandle = terminalHandle
   let terminal = await runtime.showTerminal(effectiveHandle).catch(() => null)
@@ -157,7 +139,8 @@ export function exposeObservation(observation: Awaited<ReturnType<typeof inspect
     status: observation.status,
     exactWorker: observation.exact,
     ...(observation.reason ? { reason: observation.reason } : {}),
-    ...(observation.agentWait !== undefined ? { agentWait: observation.agentWait } : {})
+    ...(observation.agentWait !== undefined ? { agentWait: observation.agentWait } : {}),
+    ...(observation.addressable !== undefined ? { addressable: observation.addressable } : {})
   }
 }
 
@@ -166,7 +149,8 @@ function exposeContextOnlyWorker(dispatch: DispatchContextRow) {
     dispatchId: dispatch.id,
     runtimeEpoch: null,
     state: 'unsupervised' as const,
-    stage: dispatch.capability_hash ? 'injected' : 'context_only',
+    // Why: with no worker row Orca supervises only the context; it keeps no record of an --inject paste.
+    stage: 'context_only',
     worktreeId: null,
     agentTerminalHandle: dispatch.assignee_handle,
     setupState: 'not_applicable',
@@ -269,7 +253,8 @@ export function projectFleetWorkerPage(
     attentionFacts: db.getWorkerAttentionFactsForDispatches([dispatchId], now),
     statuses: runtime.getOrchestrationFleetAgentStatusSnapshot(),
     limit: 1,
-    now
+    now,
+    observeChat: (sessionId) => observeChatAssignee(sessionId, db)
   })
 }
 

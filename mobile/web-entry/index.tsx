@@ -11,6 +11,7 @@ import {
   stampPageMountState,
   type PageMountTarget
 } from '../src/mobile-web-shell/bridge/page-bootstrap'
+import { storageReadResultSchema } from '../src/mobile-web-shell/bridge/bridge-native-verbs'
 import { publishPageStorage } from '../src/mobile-web-shell/bridge/page-async-storage'
 import {
   RouteScreenPaintProvider,
@@ -20,6 +21,7 @@ import { PageFaultBoundary } from '../src/mobile-web-shell/bridge/page-fault-bou
 import { publishPageHostProfile } from '../src/mobile-web-shell/bridge/page-host-profile'
 import { publishExternalLinkOpener } from '../src/platform/external-link.web'
 import { publishHapticsNotifier } from '../src/platform/haptics.web'
+import { publishShellKeyboardSource } from '../src/platform/keyboard-occlusion.web'
 // Named with its extension: this entry is the web build's and the provider it needs is the web
 // sibling's, which takes the page's client. The screens below still import `./client-context`
 // and reach the same module, because the builder resolves both specifiers to the same file.
@@ -111,6 +113,11 @@ bootstrapShellPage({
     // The same shape again, and for the same reason: every haptic on this page is played from a
     // plain function inside a row's press handler, which no provider wraps.
     publishHapticsNotifier((kind) => client.notifyHaptics(kind))
+    // The shell's keyboard height, read by plain functions as well as hooks; 0 while it is closed.
+    publishShellKeyboardSource({
+      read: () => client.getShellSession()?.keyboardInset ?? 0,
+      subscribe: client.onKeyboardInsetUpdate
+    })
     // Scoped to the host `init` named: with none, no key is writable, which is the right answer
     // for a shell too old to say whose list this is.
     publishPageStorage(
@@ -118,7 +125,13 @@ bootstrapShellPage({
       (key, value) => client.notifyStorageWrite(key, value),
       session.host?.id ?? '',
       session.route?.pathname ?? '',
-      session.storageOversize
+      session.storageOversize,
+      session.ownsHostArea
+        ? async (key) =>
+            storageReadResultSchema.parse(
+              (await client.callNativeVerb('native.storage.read', { key })).result
+            ).value
+        : null
     )
     createRoot(container).render(
       // Above `ExpoRoot`, not inside its wrapper: a route this bundle cannot resolve or import

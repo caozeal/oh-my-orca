@@ -1,3 +1,12 @@
+import {
+  projectPendingWorktreeRemovals,
+  snapshotPendingWorktreeRemovals,
+  withUnregisteredRemovalCheckouts
+} from '../../../worktree-removal-listing'
+import {
+  getRepoExecutionHostId,
+  getSshTargetIdForExecutionHost
+} from '../../../../shared/execution-host'
 import type { Store } from '../../../persistence/loading-store/store'
 import type { Repo } from '../../../../shared/repo-types'
 import { getSshGitProvider } from '../../../providers/ssh-git-dispatch'
@@ -25,8 +34,10 @@ import {
   type DetectedWorktreeScanResult
 } from './detected-worktree-scan-cache'
 import {
+  getLocalWorktreeCatalogVersion,
   getLocalWorktreeScanGeneration,
-  isLocalWorktreeScanGenerationCurrent
+  isLocalWorktreeScanGenerationCurrent,
+  localWorktreeCatalogVersionAt
 } from '../../../local-worktree-scan-generation'
 import type { SshGitProvider } from '../../../providers/ssh-git-provider'
 import {
@@ -50,7 +61,8 @@ async function listSshWorktreesWithMutationWitness(
   return {
     gitWorktrees,
     fresh: true,
-    superseded: !isLocalWorktreeScanGenerationCurrent(repo.id, generation)
+    superseded: !isLocalWorktreeScanGenerationCurrent(repo.id, generation),
+    generation
   }
 }
 
@@ -58,9 +70,11 @@ export async function listDetectedWorktreesForCapturedRepo(
   store: Store,
   repo: Repo,
   isCurrent: () => boolean,
-  capturedProvider = repo.connectionId ? getSshGitProvider(repo.connectionId) : undefined,
+  capturedProvider?: SshGitProvider,
   providerAbort?: { signal: AbortSignal; status: () => 'canceled' | 'timed-out' }
 ): Promise<DetectedWorktreeListResult | { providerAbortStatus: 'canceled' | 'timed-out' } | null> {
+  const connectionId = getSshTargetIdForExecutionHost(getRepoExecutionHostId(repo))
+  const provider = capturedProvider ?? (connectionId ? getSshGitProvider(connectionId) : undefined)
   const abortedResult = () =>
     providerAbort?.signal.aborted
       ? ({ providerAbortStatus: providerAbort.status() } as const)
@@ -87,20 +101,22 @@ export async function listDetectedWorktreesForCapturedRepo(
           repoId: repo.id,
           authoritative: false,
           source: 'metadata-fallback',
-          worktrees: []
+          worktrees: [],
+          catalogVersion: getLocalWorktreeCatalogVersion(repo.id)
         }
       }
       return {
         repoId: repo.id,
         authoritative: true,
         source: 'git',
+        catalogVersion: getLocalWorktreeCatalogVersion(repo.id),
         worktrees: projectResolvedWorktreeLineage(
           buildFolderDetectedWorktrees(store, repo),
           store.getAllWorktreeLineage?.() ?? {}
         )
       }
     }
-    if (repo.connectionId && !capturedProvider) {
+    if (connectionId && !provider) {
       const aborted = abortedResult()
       if (aborted) {
         return aborted
@@ -113,13 +129,15 @@ export async function listDetectedWorktreesForCapturedRepo(
         repoId: repo.id,
         authoritative: false,
         source: 'metadata-fallback',
-        worktrees: buildDisconnectedDetectedWorktrees(store, repo, worktrees)
+        worktrees: buildDisconnectedDetectedWorktrees(store, repo, worktrees),
+        catalogVersion: getLocalWorktreeCatalogVersion(repo.id)
       }
     }
+    const pendingAtScan = snapshotPendingWorktreeRemovals()
     const scan = await scanUntilNotOvertaken(
       repo.id,
-      repo.connectionId && capturedProvider
-        ? () => listSshWorktreesWithMutationWitness(capturedProvider, repo, providerAbort?.signal)
+      connectionId && provider
+        ? () => listSshWorktreesWithMutationWitness(provider, repo, providerAbort?.signal)
         : () => listDetectedGitWorktrees(store, repo),
       () => isCurrent() && !providerAbort?.signal.aborted
     )
@@ -132,6 +150,9 @@ export async function listDetectedWorktreesForCapturedRepo(
       return abortedResult() ?? null
     }
     const { gitWorktrees, fresh: freshScan, sideEffectToken, metadataPrune, hygieneDue } = scan
+    const localRows = connectionId
+      ? gitWorktrees
+      : await withUnregisteredRemovalCheckouts(repo.id, gitWorktrees)
     const aborted = abortedResult()
     if (aborted) {
       return aborted
@@ -145,7 +166,8 @@ export async function listDetectedWorktreesForCapturedRepo(
         repoId: repo.id,
         authoritative: false,
         source: 'metadata-fallback',
-        worktrees: []
+        worktrees: [],
+        catalogVersion: localWorktreeCatalogVersionAt(scan.generation)
       }
     }
     if (freshScan) {
@@ -164,11 +186,22 @@ export async function listDetectedWorktreesForCapturedRepo(
       }
     }
     loggedWorktreeListFailures.delete(`${repo.id}:${repo.path}`)
+    // Why the scan's generation, not the current one: the rows describe the catalog as of when the
+    // scan began. A client orders this against the create and remove replies it has applied.
     return {
       repoId: repo.id,
       authoritative: true,
       source: 'git',
-      worktrees: buildDetectedGitWorktrees(store, repo, gitWorktrees, allMeta)
+      catalogVersion: localWorktreeCatalogVersionAt(scan.generation),
+      worktrees: connectionId
+        ? buildDetectedGitWorktrees(store, repo, gitWorktrees, allMeta)
+        : // Why always marked: the desktop renderer ships with this main process.
+          projectPendingWorktreeRemovals(
+            buildDetectedGitWorktrees(store, repo, localRows, allMeta),
+            (worktree) => worktree.id,
+            true,
+            pendingAtScan
+          )
     }
   } catch (err) {
     const aborted = abortedResult()
@@ -187,7 +220,7 @@ export async function listDetectedWorktreesForCapturedRepo(
     // Why: retention alone leaves inert rows with no explanation; the cause rides with the listing.
     const unavailableReason = describeWorktreeScanFailure(err)
     const failureKind = classifyWorktreeScanFailure(unavailableReason)
-    if (repo.connectionId) {
+    if (connectionId) {
       const worktrees = listDisconnectedSshWorktrees(store, repo, sshWorktreeMetaIndex())
       return {
         repoId: repo.id,
@@ -195,7 +228,8 @@ export async function listDetectedWorktreesForCapturedRepo(
         source: 'metadata-fallback',
         worktrees: buildDisconnectedDetectedWorktrees(store, repo, worktrees),
         unavailableReason,
-        failureKind
+        failureKind,
+        catalogVersion: getLocalWorktreeCatalogVersion(repo.id)
       }
     }
     return {
@@ -204,7 +238,8 @@ export async function listDetectedWorktreesForCapturedRepo(
       source: 'metadata-fallback',
       worktrees: [],
       unavailableReason,
-      failureKind
+      failureKind,
+      catalogVersion: getLocalWorktreeCatalogVersion(repo.id)
     }
   }
 }

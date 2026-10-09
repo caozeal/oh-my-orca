@@ -1,19 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import { AGENT_STATUS_MAX_FIELD_LENGTH } from './agent-status-field-normalization'
+import { agentSessionFailureWords } from './agent-session-failure-words'
 import type { AgentJournalRenderItem, AgentJournalSubmission } from './agent-session-journal-types'
+import { AgentJournalRenderItemSchema } from './agent-session-journal-schemas'
 import { parsePaneKey } from './stable-pane-id'
 import {
   activeStructuredAgentSessionTurnId,
-  hasPersistedStructuredAgentSessionTurn,
   hasUnansweredStructuredAgentSessionDispatch,
   projectStructuredItemToNativeChat,
   projectStructuredItemsToNativeChat,
-  latestStructuredAgentSessionAssistantMessage,
-  activeStructuredAgentSessionToolCall,
   projectStructuredAgentSessionStatus,
+  projectStructuredAgentSessionStatusState,
   projectStructuredAgentSessionStatusSummary,
   structuredAgentSessionPaneKey
 } from './structured-agent-session-projection'
+import { statusStructuredAgentSessionToolCall } from './structured-agent-session-live-turn'
+import { latestStructuredAgentSessionAssistantMessage } from './structured-agent-session-latest-request'
 
 function item(
   itemId: string,
@@ -74,6 +76,10 @@ describe('structured agent session status projection', () => {
       timestamp: 2000,
       blocks: [{ type: 'tool-call' }, { type: 'tool-result', output: '@@\n+second' }]
     })
+    expect(second?.blocks).toEqual([
+      { type: 'tool-call', name: 'Diff', input: { path: 'a.ts' }, callId: 'diff' },
+      { type: 'tool-result', output: '@@\n+second', callId: 'diff' }
+    ])
     const pending = item('approval', 2, {
       kind: 'approval',
       title: 'Allow?',
@@ -97,6 +103,61 @@ describe('structured agent session status projection', () => {
       id: 'approval',
       role: 'system'
     })
+  })
+
+  it("forwards a status row's failure fact and drops one this build cannot place", () => {
+    const words = agentSessionFailureWords(
+      {
+        kind: 'providerExited',
+        detail: { text: 'stderr tail', audience: 'log' }
+      },
+      { surface: 'row' }
+    )
+    expect(
+      projectStructuredItemToNativeChat(item('exit', 1, { kind: 'status', ...words }))?.blocks[0]
+    ).toEqual({ type: 'text', ...words })
+    const future = item('future', 2, { kind: 'status', text: 'Stopped.' })
+    // A newer host's kind reads as no fact, so the row keeps its text and nothing else.
+    Object.assign(future.body, { failure: { kind: 'futureKind' } })
+    expect(projectStructuredItemToNativeChat(future)?.blocks[0]).toEqual({
+      type: 'text',
+      text: 'Stopped.'
+    })
+  })
+
+  it('names the call a tool row output answers, so a run pairs it by id', () => {
+    const projected = projectStructuredItemToNativeChat(
+      item('wait', 1, {
+        kind: 'tool-call',
+        name: 'wait_agent',
+        callId: 'call-wait',
+        input: null,
+        state: 'completed',
+        output: { head: 'CHILD_REPLY', digest: 'd', byteLength: 11, truncated: false }
+      })
+    )
+    expect(projected?.blocks).toEqual([
+      expect.objectContaining({ type: 'tool-call', callId: 'call-wait' }),
+      { type: 'tool-result', output: 'CHILD_REPLY', isError: false, callId: 'call-wait' }
+    ])
+  })
+
+  it('carries a cut-short call through the schema, and its partial output is not an error', () => {
+    const body = {
+      kind: 'tool-call' as const,
+      name: 'shell',
+      callId: 'call-sleep',
+      input: { command: 'sleep 20' },
+      state: 'failed' as const,
+      endedAs: 'interrupted' as const,
+      output: { head: 'partial', digest: 'd', byteLength: 7, truncated: false }
+    }
+    const parsed = AgentJournalRenderItemSchema.parse(item('sleep', 1, body))
+    expect(parsed.body).toMatchObject({ state: 'failed', endedAs: 'interrupted' })
+    expect(projectStructuredItemToNativeChat(item('sleep', 1, body))?.blocks).toEqual([
+      expect.objectContaining({ type: 'tool-call', state: 'failed', endedAs: 'interrupted' }),
+      { type: 'tool-result', output: 'partial', isError: false, callId: 'call-sleep' }
+    ])
   })
 
   it('projects running, attention, and completed lifecycle states', () => {
@@ -125,7 +186,7 @@ describe('structured agent session status projection', () => {
     expect(projectStructuredAgentSessionStatus([running, completed])).toBe('idle')
   })
 
-  it('summarizes status with the newest user prompt, and null before any persisted turn', () => {
+  it('summarizes status with the newest user prompt, and null before any request', () => {
     const running = item('running', 3, {
       kind: 'status',
       text: 'Working',
@@ -145,13 +206,20 @@ describe('structured agent session status projection', () => {
       ]
     })
 
-    expect(projectStructuredAgentSessionStatusSummary([running])).toEqual({
+    expect(projectStructuredAgentSessionStatusSummary([])).toEqual({
       status: null,
       latestPrompt: ''
     })
+    // A turn the provider opened on its own is a request, with no prompt to quote.
+    expect(projectStructuredAgentSessionStatusSummary([running])).toEqual({
+      status: 'working',
+      latestPrompt: '',
+      statusStartedAt: 3
+    })
     expect(projectStructuredAgentSessionStatusSummary([first, second, running])).toEqual({
       status: 'working',
-      latestPrompt: 'second line'
+      latestPrompt: 'second line',
+      statusStartedAt: 3
     })
     expect(projectStructuredAgentSessionStatusSummary([first, second])).toEqual({
       status: 'idle',
@@ -172,11 +240,13 @@ describe('structured agent session status projection', () => {
     // The first send has no journalled message until the provider replays it.
     expect(projectStructuredAgentSessionStatusSummary([], pending)).toEqual({
       status: 'working',
-      latestPrompt: ''
+      latestPrompt: '',
+      statusStartedAt: 1
     })
     expect(projectStructuredAgentSessionStatusSummary([asked], pending)).toEqual({
       status: 'working',
-      latestPrompt: 'go'
+      latestPrompt: 'go',
+      statusStartedAt: 1
     })
   })
 
@@ -228,6 +298,42 @@ describe('structured agent session status projection', () => {
     })
   })
 
+  it('still reports owed work beneath a pending prompt, which the attention status hides', () => {
+    const asked = item('asked', 1, {
+      kind: 'message',
+      role: 'user',
+      blocks: [{ type: 'text', text: 'go' }]
+    })
+    const prompt = item('prompt', 3, {
+      kind: 'approval',
+      title: 'Run command?',
+      detail: null,
+      options: [{ id: 'yes', label: 'Allow' }],
+      resolution: { state: 'pending', selectedOptionId: null, resolvedBy: null, resolvedAt: null }
+    })
+    const running = item('turn', 2, { kind: 'turn', turnId: 't1', state: 'running' })
+    const settled = item('turn', 2, {
+      kind: 'turn',
+      turnId: 't1',
+      state: 'completed',
+      outcome: 'success'
+    })
+    const accepted = [submission('m1', 'accepted')]
+    const owes = (items: AgentJournalRenderItem[], submissions = accepted) => {
+      const state = projectStructuredAgentSessionStatusState(items, submissions)
+      return [state.summary.status, state.owesWork]
+    }
+
+    expect(owes([asked, running, prompt])).toEqual(['attention', true])
+    expect(owes([asked, settled, prompt])).toEqual(['attention', false])
+    expect(owes([asked, settled, prompt], [...accepted, submission('m2', 'pending')])).toEqual([
+      'attention',
+      true
+    ])
+    expect(owes([asked, running])).toEqual(['working', true])
+    expect(owes([asked, settled])).toEqual(['idle', false])
+  })
+
   it('carries the running tool and the newest assistant prose the sidebar row shows', () => {
     const ask = item('ask', 1, {
       kind: 'message',
@@ -256,7 +362,8 @@ describe('structured agent session status projection', () => {
       latestPrompt: 'look at the sidebar',
       toolName: 'Read',
       toolInput: '/repo/src/WorktreeCard.tsx',
-      lastAssistantMessage: 'Reading the card first.'
+      lastAssistantMessage: 'Reading the card first.',
+      statusStartedAt: 2
     })
   })
 
@@ -323,7 +430,8 @@ describe('structured agent session status projection', () => {
 
     expect(projectStructuredAgentSessionStatusSummary([ask, abandoned, running])).toEqual({
       status: 'working',
-      latestPrompt: 'go'
+      latestPrompt: 'go',
+      statusStartedAt: 3
     })
   })
 
@@ -385,15 +493,6 @@ describe('structured agent session status projection', () => {
     expect(parsePaneKey(paneKey)).toMatchObject({ tabId: 'structured-agent-session-1' })
   })
 
-  it('requires a persisted provider conversation turn before TUI resume', () => {
-    const status = item('status', 1, { kind: 'status', text: 'Connected' })
-    const user = item('user', 2, { kind: 'message', role: 'user', blocks: [] })
-
-    expect(hasPersistedStructuredAgentSessionTurn([])).toBe(false)
-    expect(hasPersistedStructuredAgentSessionTurn([status])).toBe(false)
-    expect(hasPersistedStructuredAgentSessionTurn([status, user])).toBe(true)
-  })
-
   it('preserves provider-frame detail on the backward-compatible status line', () => {
     const projected = projectStructuredItemToNativeChat(
       item('frame', 1, {
@@ -418,16 +517,16 @@ describe('structured agent session status projection', () => {
 
   it('preserves structured tool lifecycle state for the live renderer', () => {
     const projected = projectStructuredItemToNativeChat(
-      item('running-tool', 1, {
+      item('ls', 1, {
         kind: 'tool-call',
         name: 'shell',
-        input: { command: 'cat package.json' },
+        input: { command: 'ls' },
         state: 'running'
       })
     )
 
     expect(projected?.blocks).toEqual([
-      { type: 'tool-call', name: 'shell', input: { command: 'cat package.json' }, state: 'running' }
+      { type: 'tool-call', name: 'shell', input: { command: 'ls' }, state: 'running', callId: 'ls' }
     ])
   })
 
@@ -456,6 +555,7 @@ describe('structured agent session status projection', () => {
 describe('notice projection for desktop and mobile consumers', () => {
   it.each([
     { presentation: 'compaction' },
+    { presentation: 'compaction-skipped', tone: 'warning' },
     { presentation: 'plan-document' },
     { tone: 'warning' },
     { tone: 'error' },
@@ -560,7 +660,7 @@ describe("producer linkage — a subagent's output never speaks for the parent",
 
   it("shows the parent's own prose and its own running call, not the child's newer ones", () => {
     expect(latestStructuredAgentSessionAssistantMessage(items)).toBe('delegating')
-    expect(activeStructuredAgentSessionToolCall(items)?.name).toBe('Task')
+    expect(statusStructuredAgentSessionToolCall(items)?.name).toBe('Task')
   })
 
   it("publishes the parent's own line and call on the summary the sidebar reads", () => {
@@ -573,6 +673,25 @@ describe("producer linkage — a subagent's output never speaks for the parent",
     expect(summary.toolInput).toBeTruthy()
   })
 
+  it("names the parent's own settled call, not a child's newer settled one", () => {
+    const parentRead = item('root-read', 4, {
+      kind: 'tool-call',
+      name: 'Read',
+      input: { file_path: '/repo/a.ts' },
+      state: 'completed'
+    })
+    const childFailed = childItem('child-grep', 6, {
+      kind: 'tool-call',
+      name: 'Grep',
+      input: { pattern: 'x' },
+      state: 'failed'
+    })
+    expect(
+      projectStructuredAgentSessionStatusSummary([userAsk, turnRunning, parentRead, childFailed])
+        .toolName
+    ).toBe('Read')
+  })
+
   it("still renders the child's output in the transcript", () => {
     // The other direction: scoping the STATUS readers must not delete subagent
     // output from the chat.
@@ -581,6 +700,18 @@ describe("producer linkage — a subagent's output never speaks for the parent",
     )
     expect(prose).toContain('looking')
     expect(prose).toContain('delegating')
+  })
+
+  it("keeps the child's output as the child's: the transcript message names its producer", () => {
+    // Rendering the child's rows is not enough; unless the message still says who
+    // wrote it, the transcript can only present it as the parent speaking.
+    const messages = projectStructuredItemsToNativeChat(items)
+    const byId = new Map(messages.map((message) => [message.id, message]))
+    expect(byId.get('child-prose')).toMatchObject({ agentId: 'task-1', producerKind: 'agent' })
+    expect(byId.get('child-grep')).toMatchObject({ agentId: 'task-1' })
+    // The session's own rows name no producer: absence is the claim that they are its own.
+    expect(byId.get('root-prose')).not.toHaveProperty('agentId')
+    expect(byId.get('root-task')).not.toHaveProperty('agentId')
   })
 
   it("falls back to nothing rather than a child's line when the parent said nothing", () => {
@@ -603,7 +734,7 @@ describe("producer linkage — a subagent's output never speaks for the parent",
     // reachable today — the point is that the rule does not rely on that.)
     const windowed = [childProse, childCall]
     expect(latestStructuredAgentSessionAssistantMessage(windowed)).toBe('')
-    expect(activeStructuredAgentSessionToolCall(windowed)).toBeNull()
+    expect(statusStructuredAgentSessionToolCall(windowed)).toBeNull()
   })
 
   it("does not quote a subagent's own user-role prompt as the session's", () => {
@@ -676,5 +807,82 @@ describe("producer linkage — a subagent's output never speaks for the parent",
         childProse
       ])
     ).toBe('legacy child line')
+  })
+})
+
+describe('the turn verdict on the status summary', () => {
+  const user = item('u1', 1, {
+    kind: 'message',
+    role: 'user',
+    blocks: [{ type: 'text', text: 'go' }]
+  })
+
+  it('carries the newest settled turn verdict only while the session is idle', () => {
+    const running = item('turn-running', 2, {
+      kind: 'turn',
+      turnId: 'turn-1',
+      state: 'running'
+    })
+    expect(projectStructuredAgentSessionStatusSummary([user, running])).not.toHaveProperty(
+      'turnOutcome'
+    )
+    const cancelled = item('turn-cancelled', 3, {
+      kind: 'turn',
+      turnId: 'turn-1',
+      state: 'interrupted',
+      outcome: 'cancellation'
+    })
+    expect(projectStructuredAgentSessionStatusSummary([user, cancelled])).toMatchObject({
+      status: 'idle',
+      turnOutcome: 'cancellation'
+    })
+  })
+
+  it('reports no verdict for a completed turn the provider never judged', () => {
+    const completed = item('turn-completed', 2, {
+      kind: 'turn',
+      turnId: 'turn-1',
+      state: 'completed'
+    })
+    expect(projectStructuredAgentSessionStatusSummary([user, completed])).not.toHaveProperty(
+      'turnOutcome'
+    )
+  })
+
+  // With no verdict from the provider, the lifecycle the host settled is what the row reports.
+  it.each([
+    ['interrupted', 'interruption'],
+    ['unverifiable', 'unconfirmed']
+  ] as const)(
+    'reads an %s turn the provider never judged as its host-observed end',
+    (state, outcome) => {
+      const ended = item('turn-ended', 2, { kind: 'turn', turnId: 'turn-1', state })
+      expect(projectStructuredAgentSessionStatusSummary([user, ended])).toMatchObject({
+        status: 'idle',
+        turnOutcome: outcome
+      })
+    }
+  )
+
+  it("keeps the provider's own verdict over what the host observed of the end", () => {
+    for (const outcome of ['cancellation', 'failure', 'success'] as const) {
+      const judged = item('turn-judged', 2, {
+        kind: 'turn',
+        turnId: 'turn-1',
+        state: 'interrupted',
+        outcome
+      })
+      expect(projectStructuredAgentSessionStatusSummary([user, judged])).toMatchObject({
+        turnOutcome: outcome
+      })
+    }
+  })
+
+  it('keeps the observed end off the request the completion feed announces', () => {
+    const ended = item('turn-ended', 2, { kind: 'turn', turnId: 'turn-1', state: 'interrupted' })
+    expect(projectStructuredAgentSessionStatusState([user, ended]).latestRequest).toMatchObject({
+      turnState: 'interrupted',
+      outcome: null
+    })
   })
 })
