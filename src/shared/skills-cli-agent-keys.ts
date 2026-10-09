@@ -38,7 +38,6 @@ export const SKILLS_CLI_AGENT_KEY_BY_TUI_AGENT = {
   aug: 'augment',
   cline: 'cline',
   codebuff: null,
-  codebuddy: 'codebuddy',
   freebuff: null,
   'command-code': 'command-code',
   continue: 'continue',

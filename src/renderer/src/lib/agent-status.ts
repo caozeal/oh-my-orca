@@ -124,7 +124,6 @@ const ICONABLE_AGENT_TYPES: Record<TerminalAgent, true> = {
   aug: true,
   cline: true,
   codebuff: true,
-  codebuddy: true,
   freebuff: true,
   'command-code': true,
   continue: true,
