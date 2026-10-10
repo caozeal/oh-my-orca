@@ -40,7 +40,6 @@ export const MOBILE_TUI_AGENT_FAVICON_DOMAINS: Partial<Record<TuiAgent, string>>
   autohand: 'autohand.ai',
   cline: 'cline.bot',
   codebuff: 'codebuff.com',
-  codebuddy: 'www.codebuddy.ai',
   freebuff: 'freebuff.com',
   'command-code': 'commandcode.ai',
   continue: 'continue.dev',
