@@ -17,7 +17,7 @@ import {
   type PendingNativeRequest,
   writeNativeProviderLine
 } from './macos-native-provider-contract'
-import { resolveMacOSComputerUseExecutablePath } from './macos-native-provider-paths'
+import { resolveMacOSComputerUseAppPath } from './macos-native-provider-paths'
 import { MacOSProviderProcessOwner } from './macos-native-provider-process-reaping'
 import {
   attachMacOSNativeProviderSocketListeners,
@@ -96,11 +96,11 @@ export class MacOSNativeProviderClient {
   }
   private async send(method: NativeMethod, params: unknown): Promise<unknown> {
     const id = this.nextId++
-    const helperExecutablePath = resolveMacOSComputerUseExecutablePath()
-    if (!helperExecutablePath) {
+    const helperAppPath = resolveMacOSComputerUseAppPath()
+    if (!helperAppPath) {
       throw new RuntimeClientError('accessibility_error', 'Orca Computer Use.app was not found')
     }
-    const transport = await this.ensureSocketStarted(helperExecutablePath)
+    const transport = await this.ensureSocketStarted(helperAppPath)
     const token = this.socketToken
     const line = `${JSON.stringify({ id, method, params, token })}\n`
     const result = new Promise<unknown>((resolve, reject) => {
@@ -169,7 +169,7 @@ export class MacOSNativeProviderClient {
   private async ensureActionSupported(method: NativeActionMethod): Promise<void> {
     await this.ensureCapability('actions', macOSActionCapabilityKey(method))
   }
-  private async ensureSocketStarted(helperExecutablePath: string): Promise<net.Socket> {
+  private async ensureSocketStarted(helperAppPath: string): Promise<net.Socket> {
     if (this.socket && !this.socket.destroyed) {
       return this.socket
     }
@@ -178,7 +178,7 @@ export class MacOSNativeProviderClient {
     if (this.socketStartPromise) {
       return await this.socketStartPromise
     }
-    const socketStartPromise = this.startSocket(helperExecutablePath)
+    const socketStartPromise = this.startSocket(helperAppPath)
     this.socketStartPromise = socketStartPromise
     try {
       return await socketStartPromise
@@ -188,10 +188,10 @@ export class MacOSNativeProviderClient {
       }
     }
   }
-  private async startSocket(helperExecutablePath: string): Promise<net.Socket> {
+  private async startSocket(helperAppPath: string): Promise<net.Socket> {
     const startGeneration = ++this.socketStartGeneration
     const started = await startMacOSNativeProviderSocket({
-      helperExecutablePath,
+      helperAppPath,
       isCurrent: (socketPath) =>
         this.socketStartGeneration === startGeneration &&
         (this.socketPath === null || this.socketPath === socketPath),

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type net from 'node:net'
 import { release, tmpdir } from 'node:os'
@@ -12,6 +12,7 @@ import {
 import { RuntimeClientError } from './runtime-client-error'
 
 const HELPER_CONNECT_TIMEOUT_MS = 10_000
+const HELPER_EXECUTABLE_NAME = 'orca-computer-use-macos'
 
 export type StartedMacOSProviderSocket = {
   socket: net.Socket
@@ -89,11 +90,11 @@ export function consumeNativeProviderLines(
 }
 
 export async function startMacOSNativeProviderSocket({
-  helperExecutablePath,
+  helperAppPath,
   isCurrent,
   providerProcess
 }: {
-  helperExecutablePath: string
+  helperAppPath: string
   isCurrent: (socketPath: string) => boolean
   providerProcess: MacOSProviderProcessOwner
 }): Promise<StartedMacOSProviderSocket> {
@@ -103,10 +104,12 @@ export async function startMacOSNativeProviderSocket({
   const socketToken = randomUUID()
   const socketTokenPath = join(socketDirectory, 'provider.token')
   writeFileSync(socketTokenPath, socketToken, { encoding: 'utf8', mode: 0o600 })
-  // Why: launching the nested helper via LaunchServices can make TCC evaluate
-  // Orca.app as responsible; the signed helper executable owns this grant.
-  const provider = spawnProvider(helperExecutablePath, socketPath, socketTokenPath)
-  // Why: own the helper from birth. Adopting only after connect leaves a window
+  // Why: the helper only owns its TCC grants when LaunchServices launches it.
+  // Spawning it directly makes macOS treat the responsible process — the Orca
+  // app — as the Accessibility client, so the helper's own grant is never read
+  // and every accessibility call is denied.
+  const provider = spawnProvider(helperAppPath, socketPath, socketTokenPath)
+  // Why: own the launch from birth. Adopting only after connect leaves a window
   // where a quit during startup strands it with nobody holding the handle.
   providerProcess.adopt(provider)
   const providerFailure = waitForProviderLaunchFailure(provider)
@@ -129,12 +132,15 @@ export async function startMacOSNativeProviderSocket({
   } catch (error) {
     connectAbort.abort()
     providerFailure.cleanup()
-    // Why: connect failures and superseded startups both happen after spawn;
-    // escalate so a helper that ignores SIGTERM cannot outlive the attempt.
+    // Why: `open` exits once LaunchServices owns the app, so the helper is left
+    // as a launchd child and this socket path is the only handle on it.
+    stopProviderForSocket(socketPath)
+    // Why: escalate on the spawned handle too, so an `open` wedged past spawn
+    // cannot outlive the failed attempt.
     reapMacOSProviderProcess(provider)
     // Each attempt owns a unique directory, even after its generation is superseded.
     cleanupSocketDirectory(socketDirectory)
-    throw error
+    throw withProviderStartupHint(error, socketPath, providerFailure.stderr)
   }
 }
 
@@ -143,14 +149,14 @@ function cleanupSocketDirectory(socketDirectory: string): void {
 }
 
 function spawnProvider(
-  helperExecutablePath: string,
+  helperAppPath: string,
   socketPath: string,
   socketTokenPath: string
 ): ChildProcess {
   const provider = spawn(
-    helperExecutablePath,
-    ['--agent', socketPath, '--token-file', socketTokenPath],
-    { detached: true, stdio: 'ignore' }
+    '/usr/bin/open',
+    ['-n', helperAppPath, '--args', '--agent', socketPath, '--token-file', socketTokenPath],
+    { detached: true, stdio: ['ignore', 'ignore', 'pipe'] }
   )
   provider.unref()
   return provider
@@ -159,8 +165,10 @@ function spawnProvider(
 function waitForProviderLaunchFailure(provider: ChildProcess): {
   promise: Promise<never>
   cleanup: () => void
+  stderr: () => string
 } {
   let cleanup = (): void => {}
+  let stderrText = ''
   const promise = new Promise<never>((_resolve, reject) => {
     const fail = (error: Error) => {
       reject(
@@ -171,21 +179,64 @@ function waitForProviderLaunchFailure(provider: ChildProcess): {
       )
     }
     const exit = (code: number | null, signal: NodeJS.Signals | null) => {
+      // Why: `open` exits 0 as soon as LaunchServices takes over the app, so a
+      // clean exit is not the helper dying — only a non-zero one is a failure.
+      if (code === 0) {
+        return
+      }
+      const detail = typeof code === 'number' ? `code ${code}` : `signal ${signal ?? 'unknown'}`
       reject(
         new RuntimeClientError(
           'accessibility_error',
-          `native macOS helper app exited before connecting: ${
-            typeof code === 'number' ? `code ${code}` : `signal ${signal ?? 'unknown'}`
-          }`
+          `native macOS helper app launch command failed: ${detail}`
         )
       )
     }
+    const onStderrData = (chunk: string): void => {
+      stderrText += chunk
+    }
+    provider.stderr?.setEncoding('utf8')
+    provider.stderr?.on('data', onStderrData)
     provider.once('error', fail)
     provider.once('exit', exit)
     cleanup = () => {
       provider.off('error', fail)
       provider.off('exit', exit)
+      provider.stderr?.off('data', onStderrData)
     }
   })
-  return { promise, cleanup }
+  return { promise, cleanup, stderr: () => stderrText }
+}
+
+/** Identifies one helper by the socket path it was launched with. */
+function providerProcessPattern(socketPath: string): string {
+  return `${HELPER_EXECUTABLE_NAME} --agent ${socketPath}`
+}
+
+function providerProcessIsRunning(socketPath: string): boolean {
+  const found = spawnSync('/usr/bin/pgrep', ['-f', providerProcessPattern(socketPath)], {
+    stdio: 'ignore'
+  })
+  return found.status === 0
+}
+
+function stopProviderForSocket(socketPath: string): void {
+  spawnSync('/usr/bin/pkill', ['-f', providerProcessPattern(socketPath)], { stdio: 'ignore' })
+}
+
+function withProviderStartupHint(
+  error: unknown,
+  socketPath: string,
+  launchStderr: () => string
+): unknown {
+  // Why: LaunchServices owns the helper now, so its exit code is unobservable and
+  // a stalled socket is the only remaining evidence of how startup failed.
+  if (!(error instanceof RuntimeClientError) || error.code !== 'action_timeout') {
+    return error
+  }
+  const detail = launchStderr().trim()
+  const hint = providerProcessIsRunning(socketPath)
+    ? 'The helper process is running but did not open its socket.'
+    : `No helper process is running${detail ? `: ${detail}` : '.'}`
+  return new RuntimeClientError(error.code, `${error.message} ${hint}`)
 }
