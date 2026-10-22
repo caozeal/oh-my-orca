@@ -36,7 +36,7 @@ vi.mock('electron', () => ({
   app: { getPath: appGetPathMock },
   session: { fromPartition: sessionFromPartitionMock }
 }))
-vi.mock('../../shared/child-process/run-process', () => ({
+vi.mock('@orca/process-host', () => ({
   runProcessSync: runProcessSyncMock
 }))
 vi.mock('./browser-session-registry', () => ({
@@ -95,7 +95,7 @@ vi.mock('./browser-cookie-clear-store', () => ({
   })
 }))
 
-import { importChromiumCookies } from './browser-cookie-chromium-import'
+import { importChromiumCookies } from './cookies/chromium/import-cookies'
 import { createChromiumCookieTestDatabase } from './browser-cookie-import-test-database'
 import { DatabaseSync } from 'node:sqlite'
 

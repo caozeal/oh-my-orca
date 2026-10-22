@@ -1,14 +1,15 @@
 import type { ManagedPane, PaneManager } from '@/lib/pane-manager/pane-manager'
-import type { PtyTransport } from './pty-transport'
+import type { PtyTransport } from './pty-transport-types'
 import { requestNativeChatCoverPaste } from './native-chat-cover-paste'
 import { getConnectionId } from '@/lib/connection-context'
-import { getRuntimeEnvironmentIdForWorktree } from '@/lib/worktree-runtime-owner'
 import { getShortcutPlatform } from '@/lib/shortcut-platform'
 import { pasteTerminalClipboard } from './terminal-clipboard-paste'
-import type { TerminalPasteSource, TerminalPasteTextOptions } from './terminal-paste-coordinator'
+import type { TerminalPasteSource, TerminalPasteTextOptions } from './terminal-paste-model'
 import { formatTerminalPasteExecutionError } from './terminal-paste-errors'
-import { resolveTerminalPasteRuntime } from './terminal-paste-runtime'
-import { getTerminalPasteSshRemotePlatform } from './terminal-paste-ssh-platform'
+import {
+  resolveTerminalPasteRuntime,
+  resolveTerminalPasteRuntimeEnvironmentId
+} from './terminal-paste-runtime'
 import { isTerminalPanePasteTargetCurrent } from './terminal-paste-target-state'
 import { pasteTextIntoTerminalPane } from './terminal-pane-paste-dispatch'
 import { scheduleImagePasteWebglAtlasRecovery } from './terminal-webgl-atlas-recovery'
@@ -49,7 +50,6 @@ export const executeTerminalPaneMenuPasteText = async (
   text: string,
   options?: TerminalPasteTextOptions
 ): Promise<boolean> => {
-  const connectionId = getConnectionId(context.worktreeId) ?? null
   const transport = context.paneTransportsRef.current.get(pane.id)
   const ptyId = transport?.getPtyId() ?? null
   const isTargetMounted = (): boolean => isPanePasteTargetMounted(context, pane, transport, ptyId)
@@ -61,8 +61,6 @@ export const executeTerminalPaneMenuPasteText = async (
     runtime: resolveTerminalPasteRuntime({
       platform: getShortcutPlatform(),
       ptyId,
-      connectionId,
-      remotePlatform: getTerminalPasteSshRemotePlatform(connectionId),
       transport,
       isWindowsConpty: context.forceBracketedMultilineTextPaste
     }),
@@ -99,8 +97,12 @@ export const pasteTerminalPaneMenuClipboard = async (
   const { tabId, worktreeId, forceBracketedMultilineTextPaste, onPasteError } = context
   const connectionId = getConnectionId(worktreeId) ?? null
   const state = useAppStore.getState()
-  const runtimeEnvironmentId = getRuntimeEnvironmentIdForWorktree(state, worktreeId)
   const transport = context.paneTransportsRef.current.get(pane.id) ?? null
+  const runtimeEnvironmentId = resolveTerminalPasteRuntimeEnvironmentId(
+    state,
+    worktreeId,
+    transport
+  )
   const result = await pasteTerminalClipboard({
     readClipboardText: window.api.ui.readClipboardText,
     saveClipboardImageAsTempFile: window.api.ui.saveClipboardImageAsTempFile,

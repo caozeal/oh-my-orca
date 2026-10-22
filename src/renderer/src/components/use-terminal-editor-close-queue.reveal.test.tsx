@@ -15,7 +15,15 @@ const revealFloatingWorkspacePanel = vi.hoisted(() => vi.fn())
 vi.mock('../store', () => ({
   useAppStore: {
     // "Don't Save" closes through the store, beside the controller's own projection.
-    getState: () => ({ ...store, markFileDirty: vi.fn(), clearEditorDraft: vi.fn(), closeFile }),
+    getState: () => ({
+      ...store,
+      editorBufferIdOf: {},
+      editorBufferViews: {},
+      setActiveWorktree,
+      markFileDirty: vi.fn(),
+      clearEditorDraft: vi.fn(),
+      closeFile
+    }),
     subscribe: () => () => {}
   }
 }))
@@ -29,7 +37,7 @@ vi.mock('@/lib/shutdown-checkpoint-failure-toast', () => ({
 }))
 vi.mock('./editor/editor-autosave', async (importActual) => ({
   ...(await importActual<typeof EditorAutosaveModule>()),
-  requestEditorSaveQuiesce: vi.fn(async () => {})
+  requestEditorSaveQuiesce: vi.fn(async () => () => {})
 }))
 
 const { useTerminalEditorCloseFoundation } = await import('./use-terminal-editor-close-foundation')

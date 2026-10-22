@@ -1,9 +1,11 @@
+import type { StructuredAgentSessionChildWorkProducer } from '../native-chat/agent-session-wire/structured-agent-session-subagent-rows'
 import type {
   AgentSessionBackgroundTask,
   AgentSessionBackgroundTaskState
 } from '../../shared/agent-session-wire'
 import type { AgentChildWorkEvidence } from '../../shared/agent-status-child-work-evidence'
 import {
+  observeCodexExecutionFrame,
   readCodexBackgroundTaskFrame,
   type CodexBackgroundTaskEvent
 } from './codex-background-task-frames'
@@ -12,7 +14,7 @@ import { CodexBackgroundCommandTracker } from './codex-background-command-tracke
 import { CodexChildWorkEvidence } from './codex-child-work-evidence'
 import type { CodexAbandonedCommand } from './codex-prompt-registry'
 import type { CodexStructuredSessionAdapterDeps } from './codex-structured-session-state'
-import { boundSubagentField } from '../native-chat/agent-session-journal/journal-subagent-group-body'
+import { boundSubagentLabel } from '../native-chat/agent-session-journal/journal-subagent-item'
 
 /** Where a session's child-work evidence goes, and the host clock that stamps it. */
 export type CodexChildWorkSink = {
@@ -22,10 +24,11 @@ export type CodexChildWorkSink = {
 
 export function codexChildWorkSink(
   sessionId: string,
-  deps: Pick<CodexStructuredSessionAdapterDeps, 'onChildWorkEvidence' | 'now'>
+  deps: Pick<CodexStructuredSessionAdapterDeps, 'onChildWorkEvidence' | 'now'>,
+  producer?: StructuredAgentSessionChildWorkProducer
 ): CodexChildWorkSink {
   return {
-    deliver: (evidence) => deps.onChildWorkEvidence?.(sessionId, evidence),
+    deliver: (evidence) => deps.onChildWorkEvidence?.(sessionId, evidence, producer),
     now: () => deps.now?.() ?? Date.now()
   }
 }
@@ -87,13 +90,47 @@ export class CodexBackgroundTaskTracker {
     return this.stopsTerminals ? this.commands.backgroundProcesses(taskIds) : []
   }
 
+  /** What a Stop of the named sub-agents reaches: the run each one and each of its descendants is
+   *  working on, and, when this app-server can terminate them, the processes their threads hold.
+   *  A sub-agent row's providerId is its thread id. */
+  subagentStopTargets(taskIds: readonly string[]): {
+    turns: { threadId: string; turnId: string }[]
+    terminals: { threadId: string; processId: string }[]
+  } {
+    const named = new Set(taskIds)
+    const lineage = this.executions
+      .workingChildren()
+      .filter((child) => named.has(child.agentThreadId))
+      .flatMap((child) => this.executions.lineage(child.agentThreadId))
+    const threads = [...new Set(lineage.map((child) => child.agentThreadId))]
+    return {
+      turns: threads.flatMap((threadId) => {
+        const execution = this.executions.find(threadId)?.execution
+        return execution?.state === 'working' ? [{ threadId, turnId: execution.turnId }] : []
+      }),
+      terminals: this.stopsTerminals
+        ? threads.flatMap((threadId) =>
+            this.commands
+              .threadCommands(threadId)
+              .flatMap((command) =>
+                command.type === 'started' && command.processId !== undefined
+                  ? [{ threadId, processId: command.processId }]
+                  : []
+              )
+          )
+        : []
+    }
+  }
+
+  /** Whether the sub-agent is still working on this run. */
+  runsSubagentTurn(threadId: string, turnId: string): boolean {
+    const execution = this.executions.find(threadId)?.execution
+    return execution?.state === 'working' && execution.turnId === turnId
+  }
+
   get state(): AgentSessionBackgroundTaskState | null {
     // Journal admission precedes observe; readers must not see its pending facts.
     return this.publishedState
-  }
-
-  canObserve(event: CodexBackgroundTaskEvent): boolean {
-    return this.commands.canObserve(event)
   }
 
   /** `unapproved`: commands whose approval the journal dropped with this frame's turn ending. */
@@ -115,20 +152,7 @@ export class CodexBackgroundTaskTracker {
           ? [command]
           : [])
     ]
-    if (frame?.kind === 'subagents') {
-      for (const child of frame.children) {
-        this.executions.register(
-          child.agentThreadId,
-          child.label,
-          child.parentTurnId,
-          child.spawnerThreadId
-        )
-      }
-    } else if (frame?.kind === 'thread-closed') {
-      this.executions.closeThread(frame.threadId)
-    } else if (frame && frame.threadId !== this.primaryThreadId) {
-      this.executions.observeTurn(frame.threadId, frame.turnId, frame.state)
-    }
+    observeCodexExecutionFrame(this.executions, frame, this.primaryThreadId)
     this.childWork.observe(event, frame, commands)
     if (!frame) {
       return itemEvent || commands.length > 0 ? this.refresh() : false
@@ -162,10 +186,10 @@ export class CodexBackgroundTaskTracker {
 
   private tasks(): AgentSessionBackgroundTask[] {
     const children = this.executions.workingChildren()
-    const agents: AgentSessionBackgroundTask[] = children.map((child, index) => ({
+    const agents: AgentSessionBackgroundTask[] = children.map((child) => ({
       id: `codex-agent:${child.agentThreadId}`,
       kind: 'agent',
-      ...(child.label ? { description: boundSubagentField(child.label, index) } : {})
+      ...(child.label ? { description: boundSubagentLabel(child.label) } : {})
     }))
     return [
       ...agents,

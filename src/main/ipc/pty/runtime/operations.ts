@@ -1,16 +1,11 @@
 import { isRemoteRuntimePtyId } from '../../../../shared/remote-runtime-pty-id'
 import { LOCAL_EXECUTION_HOST_ID } from '../../../../shared/execution-host'
-import type { IPtyProvider } from '../../../providers/types'
+import type { IPtyProvider } from '../../../providers/pty-provider-contract'
 import { LocalPtyProvider } from '../../../providers/local-pty-provider'
 import { ptyOwnership } from '../provider/ownership-state'
 import { ptySizes } from '../delivery/visibility-state'
 import { rendererSerializerReadiness } from '../pane/serializer-state'
-import {
-  getProviderForPty,
-  getPtySshConnectionId,
-  localProvider,
-  resolvePtyExecutionHost
-} from '../provider/registry'
+import { getProviderForPty, localProvider, resolvePtyExecutionHost } from '../provider/registry'
 import { inspectPtyProviderProcess } from '../../../providers/pty-process-inspection'
 import type { PtyRuntimeControllerDeps } from './controller-deps'
 import {
@@ -97,10 +92,9 @@ export async function probePtyLivenessFromRuntimeController(
     if (isRemoteRuntimePtyId(ptyId)) {
       return null
     }
-    const connectionId = getPtySshConnectionId(ptyId)
     // Why: during cold start the daemon swap is in flight; the pre-swap
     // fallback would answer absent for every daemon-owned id.
-    const startupPromise = deps.getLocalPtyProviderStartupPromise(connectionId)
+    const startupPromise = deps.getLocalPtyProviderStartupPromise(resolvePtyExecutionHost(ptyId))
     if (startupPromise) {
       await startupPromise
     }
@@ -144,6 +138,9 @@ export async function attachPtyFromRuntimeController(
         attachResult.providerSequence,
         sequenceBeforeProviderAttach
       )
+    }
+    if (attachResult?.lastTitle) {
+      deps.runtime?.seedTerminalRestoreTail?.(ptyId, { lastTitle: attachResult.lastTitle })
     }
     return true
   } catch {
@@ -244,8 +241,7 @@ export function hasPtyFromRuntimeController(
     if (isRemoteRuntimePtyId(ptyId)) {
       return null
     }
-    const connectionId = getPtySshConnectionId(ptyId)
-    const startupPromise = deps.getLocalPtyProviderStartupPromise(connectionId)
+    const startupPromise = deps.getLocalPtyProviderStartupPromise(resolvePtyExecutionHost(ptyId))
     if (startupPromise && !settledLocalPtyProviderStartups.has(startupPromise)) {
       // Why: a sync probe cannot wait out the cold-start daemon swap the way
       // probePtyLiveness does, and the pre-swap provider's "no PTY" for a

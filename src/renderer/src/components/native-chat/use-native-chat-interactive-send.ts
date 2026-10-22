@@ -2,9 +2,9 @@ import { useCallback, useLayoutEffect, useRef } from 'react'
 import { useAppStore } from '../../store'
 import { sendRuntimePtyInput } from '@/runtime/runtime-terminal-inspection'
 import { sendRuntimePtyInputVerified } from '@/runtime/runtime-terminal-verified-input'
-import { getSettingsForAgentTabRuntimeOwner } from '@/lib/agent-paste-draft'
 import type { AgentType } from '../../../../shared/native-chat-types'
 import {
+  nativeChatAskRequiresTerminal,
   resolveNativeChatTranscriptAgent,
   shouldStepNativeChatAskAnswer
 } from '../../../../shared/native-chat-agent-support'
@@ -57,7 +57,6 @@ export type NativeChatInteractiveSend = {
  * `sendNativeChatMessage`. Control strings (option digits, ESC) are written raw.
  */
 export function useNativeChatInteractiveSend(
-  terminalTabId: string,
   paneKey: string,
   targetPtyId: string | null,
   agent: AgentType
@@ -72,38 +71,26 @@ export function useNativeChatInteractiveSend(
   }, [])
   // Why: a split can be rebound without unmounting this view. Cancel during
   // commit so no delayed answer write can race the replacement PTY.
-  useLayoutEffect(
-    () => cancelInFlight,
-    [agent, cancelInFlight, paneKey, targetPtyId, terminalTabId]
-  )
+  useLayoutEffect(() => cancelInFlight, [agent, cancelInFlight, paneKey, targetPtyId])
 
   const sendRaw = useCallback(
     (raw: string) => {
       if (!targetPtyId) {
         return
       }
-      sendRuntimePtyInput(
-        getSettingsForAgentTabRuntimeOwner(terminalTabId),
-        targetPtyId,
-        raw,
-        'driving'
-      )
+      sendRuntimePtyInput(targetPtyId, raw, 'driving')
     },
-    [terminalTabId, targetPtyId]
+    [targetPtyId]
   )
 
   const sendRawVerified = useCallback(
     (raw: string): Promise<boolean> =>
       targetPtyId
-        ? sendRuntimePtyInputVerified(
-            getSettingsForAgentTabRuntimeOwner(terminalTabId),
-            targetPtyId,
-            raw,
-            'driving',
-            { requireWriteSettlement: true }
-          ).catch(() => false)
+        ? sendRuntimePtyInputVerified(targetPtyId, raw, 'driving', {
+            requireWriteSettlement: true
+          }).catch(() => false)
         : Promise.resolve(false),
-    [terminalTabId, targetPtyId]
+    [targetPtyId]
   )
 
   const sendAnswer = useCallback(
@@ -112,14 +99,18 @@ export function useNativeChatInteractiveSend(
       selections: AskAnswerSelection[],
       onDeliverySettled?: (delivered: boolean) => void
     ): { settleAfterMs: number } => {
+      if (nativeChatAskRequiresTerminal(agent)) {
+        cancelInFlight()
+        onDeliverySettled?.(false)
+        return { settleAfterMs: 0 }
+      }
       if (!targetPtyId || !hasAskAnswer(prompt, selections)) {
         return { settleAfterMs: 0 }
       }
       // Cancel any prior in-flight answer before starting a new one.
       cancelInFlight()
-      const settings = getSettingsForAgentTabRuntimeOwner(terminalTabId)
       // Selector TUIs ignore pasted labels; Codex uses a different key sequence.
-      const stepsAnswer = shouldStepNativeChatAskAnswer(agent)
+      const stepsAnswer = !prompt.replyAsMessage && shouldStepNativeChatAskAnswer(agent)
       const buildsCodexAnswer = resolveNativeChatTranscriptAgent(agent) === 'codex'
       // Why: pin the answered question's baseline BEFORE delivery. A late settle
       // callback (paced writes + remote acceptance can span seconds on SSH) must
@@ -152,14 +143,13 @@ export function useNativeChatInteractiveSend(
       }
       const handle: NativeChatSendHandle = stepsAnswer
         ? sendNativeChatAskAnswer(
-            settings,
             targetPtyId,
             buildsCodexAnswer
               ? buildCodexAskAnswerKeys(prompt, selections)
               : buildAskAnswerKeys(prompt, selections),
             onSettled
           )
-        : sendNativeChatMessage(settings, targetPtyId, formatAskAnswer(prompt, selections), {
+        : sendNativeChatMessage(targetPtyId, formatAskAnswer(prompt, selections), {
             onDeliverySettled: onSettled
           })
       // Why: native-chat answer writes bypass xterm.onData. Infer only after
@@ -171,27 +161,26 @@ export function useNativeChatInteractiveSend(
         settleAfterMs: handle.settleAfterMs
       }
     },
-    [terminalTabId, paneKey, targetPtyId, agent, cancelInFlight]
+    [paneKey, targetPtyId, agent, cancelInFlight]
   )
 
   const cancelAsk = useCallback(() => {
     cancelInFlight()
+    if (nativeChatAskRequiresTerminal(agent)) {
+      return Promise.resolve(false)
+    }
     return sendRawVerified(ESC)
-  }, [cancelInFlight, sendRawVerified])
+  }, [agent, cancelInFlight, sendRawVerified])
 
   const cancel = useCallback(() => {
     cancelInFlight()
     if (resolveNativeChatTranscriptAgent(agent) === 'opencode' && targetPtyId) {
       // OpenCode confirms interruption with a second Escape; pace writes like mobile Stop.
-      inFlightRef.current = sendNativeChatAskAnswer(
-        getSettingsForAgentTabRuntimeOwner(terminalTabId),
-        targetPtyId,
-        [{ raw: ESC }, { raw: ESC }]
-      )
+      inFlightRef.current = sendNativeChatAskAnswer(targetPtyId, [{ raw: ESC }, { raw: ESC }])
       return
     }
     sendRaw(ESC)
-  }, [agent, cancelInFlight, sendRaw, targetPtyId, terminalTabId])
+  }, [agent, cancelInFlight, sendRaw, targetPtyId])
 
   return { sendAnswer, sendRaw, sendRawVerified, cancelPending: cancelInFlight, cancelAsk, cancel }
 }

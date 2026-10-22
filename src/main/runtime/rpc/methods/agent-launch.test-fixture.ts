@@ -7,6 +7,7 @@
 
 import { vi } from 'vitest'
 import { AGENT_LAUNCH_RUNTIME_CAPABILITY } from '../../../../shared/agent-launch-runtime-capability'
+import type { WorktreeLineageWarning } from '../../../../shared/worktree/lineage-types'
 import { AgentLaunchPaneAlreadyLiveError } from '../../../../shared/agent-launch-pane-already-live'
 import type { RpcContext } from '../core'
 import { resolveRpcCallerIdentity } from '../rpc-caller-identity'
@@ -31,8 +32,11 @@ export type AgentLaunchRuntimeStubOptions = {
   }
   /** What `createManagedWorktree` reports when the workspace exists but is incomplete. */
   createWarning?: string
+  createLineageWarnings?: WorktreeLineageWarning[]
   /** What `createTerminal` reports when the surface itself came up degraded. */
   terminalWarning?: string
+  /** `createTerminal` started at the workspace root because the requested folder was gone. */
+  terminalStartupCwdFallback?: boolean
   /** The pane `createTerminal` minted. Off by default so the existing outcome assertions keep
    *  modelling a runtime that reports none — the arm `RuntimeTerminalCreate.paneKey?` allows. */
   terminalPaneKey?: string
@@ -79,6 +83,9 @@ export function runtimeStub(options: AgentLaunchRuntimeStubOptions = {}) {
   )
   return {
     getClientSettings: vi.fn(() => options.settings ?? STRUCTURED_PREFERENCE),
+    requireStore: vi.fn(() => ({
+      getSettings: () => options.settings ?? STRUCTURED_PREFERENCE
+    })),
     getStructuredAgentSessionCreateSupport: vi.fn(
       async () => options.createSupport ?? { supported: true }
     ),
@@ -114,7 +121,8 @@ export function runtimeStub(options: AgentLaunchRuntimeStubOptions = {}) {
             }
           : undefined,
         ...(options.setupReceipt ? { setupReceipt: options.setupReceipt } : {}),
-        ...(options.createWarning ? { warning: options.createWarning } : {})
+        ...(options.createWarning ? { warning: options.createWarning } : {}),
+        ...(options.createLineageWarnings ? { warnings: options.createLineageWarnings } : {})
       }
     }),
     // Args are declared so a test can assert what the launch asked for, not merely that it asked.
@@ -129,7 +137,10 @@ export function runtimeStub(options: AgentLaunchRuntimeStubOptions = {}) {
       return {
         handle: 'term_1',
         ...(options.terminalPaneKey ? { paneKey: options.terminalPaneKey } : {}),
-        ...(options.terminalWarning ? { warning: options.terminalWarning } : {})
+        ...(options.terminalWarning ? { warning: options.terminalWarning } : {}),
+        ...(options.terminalStartupCwdFallback
+          ? { startupCwdFallback: { kind: 'worktree' as const, cwd: '/repo' } }
+          : {})
       }
     }),
     showTerminal: vi.fn(async (handle: string) => ({ handle, worktreeId: 'wt-7' })),

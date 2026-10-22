@@ -11,7 +11,8 @@ import {
 } from './agent-model-catalog-entry'
 import { isStructuredAgentId } from '../../../shared/agent-session-provider-handle-encoding'
 
-const SCHEMA_VERSION = 2
+// 3: Codex models carry `serviceTiers`; an older file would offer Fast with no tier to send.
+const SCHEMA_VERSION = 3
 const SAVE_COALESCE_MS = 500
 
 export type AgentModelCatalogPersistence = {
@@ -31,15 +32,15 @@ function text(value: unknown): string | null {
   return typeof value === 'string' && value ? value : null
 }
 
-function parseEffort(value: unknown): AgentSessionOptionChoice | null {
+function parseChoice(value: unknown): AgentSessionOptionChoice | null {
   const row = asRecord(value)
-  const effort = text(row?.value)
+  const choice = text(row?.value)
   const label = text(row?.label)
-  if (!effort || !label) {
+  if (!choice || !label) {
     return null
   }
   const description = text(row?.description)
-  return { value: effort, label, ...(description ? { description } : {}) }
+  return { value: choice, label, ...(description ? { description } : {}) }
 }
 
 function parseModel(value: unknown): AgentSessionModelOption | null {
@@ -49,20 +50,34 @@ function parseModel(value: unknown): AgentSessionModelOption | null {
   if (!row || !id || !label || !Array.isArray(row.efforts)) {
     return null
   }
-  const efforts = row.efforts.map(parseEffort)
+  const efforts = row.efforts.map(parseChoice)
   if (efforts.some((effort) => effort === null)) {
     return null
   }
+  const serviceTiers = Array.isArray(row.serviceTiers)
+    ? row.serviceTiers
+        .map(parseChoice)
+        .filter((tier): tier is AgentSessionOptionChoice => tier !== null)
+    : undefined
   const description = text(row.description)
   const defaultEffort = text(row.defaultEffort)
+  const resolvedModel = text(row.resolvedModel)
   return {
     id,
     label,
+    ...(resolvedModel ? { resolvedModel } : {}),
+    ...(row.effortsKnown === false ? { effortsKnown: false as const } : {}),
     ...(description ? { description } : {}),
     isDefault: row.isDefault === true,
     ...(defaultEffort ? { defaultEffort } : {}),
     efforts: efforts.filter((effort): effort is AgentSessionOptionChoice => effort !== null),
-    ...(typeof row.supportsFastMode === 'boolean' ? { supportsFastMode: row.supportsFastMode } : {})
+    ...(typeof row.supportsFastMode === 'boolean'
+      ? { supportsFastMode: row.supportsFastMode }
+      : {}),
+    ...(typeof row.supportsAutoMode === 'boolean'
+      ? { supportsAutoMode: row.supportsAutoMode }
+      : {}),
+    ...(serviceTiers ? { serviceTiers } : {})
   }
 }
 
@@ -81,7 +96,6 @@ function parseListing(value: unknown): AgentModelCatalogListing | null {
   if (models.some((model) => model === null)) {
     return null
   }
-  const tiers = asRecord(row.fastModeTierByModel)
   const support = asRecord(row.fastModeSupport)
   const supported = support?.supported
   const supportReason = text(support?.reason)
@@ -95,13 +109,9 @@ function parseListing(value: unknown): AgentModelCatalogListing | null {
           }
         }
       : {}),
-    fastModeTierByModel: Object.fromEntries(
-      Object.entries(tiers ?? {}).filter(
-        (pair): pair is [string, string] => typeof pair[1] === 'string'
-      )
-    ),
     origin: row.origin,
-    at: row.at
+    at: row.at,
+    ...(row.complete === true ? { complete: true } : {})
   }
 }
 
@@ -111,6 +121,10 @@ function parseEntry(value: unknown): AgentModelCatalogEntry | null {
   const row = asRecord(value)
   if (!row || !isStructuredAgentId(row.agent) || typeof row.fingerprint !== 'string') {
     return null
+  }
+  if (row.agent === 'claude' || row.agent === 'codex') {
+    const display = parseListing(row.discovered) ?? parseListing(row.live)
+    return agentModelCatalogEntry(row.agent, row.fingerprint, display, null, null)
   }
   const configured = asRecord(row.configured)
   const configuredModelId = text(configured?.modelId)

@@ -1,22 +1,21 @@
-import type {
-  AgentSessionOptionCatalog,
-  CatalogModel,
-  CatalogOption
-} from './agent-session-option-catalog'
+import type { AgentSessionOptionCatalog, CatalogModel } from './agent-session-option-catalog'
+import { discoveredModel } from './structured-agent-session-discovered-model'
 import {
-  buildNativeChatSessionOptionSnapshot,
-  resolveEffectiveNativeChatModelId,
-  withTrackedNativeChatModel
-} from './native-chat-session-option-snapshot'
+  createStructuredAgentSessionOptionRecord,
+  replaceStructuredAgentSessionAnsweredValues,
+  type StructuredAgentSessionOptionRecord
+} from './structured-agent-session-option-state'
 import {
-  applyNativeChatReportedSessionOptions,
-  clearTrackedSessionOption,
-  createNativeChatSessionOptionRecord,
-  setTrackedSessionOption,
-  type NativeChatSessionOptionRecord
-} from './native-chat-session-option-state'
-import { STRUCTURED_LAUNCH_SEED_OPTION_IDS } from './native-chat-session-option-defaults'
-import type { SessionOptionDescriptor, SessionOptionValue } from './native-chat-session-options'
+  STRUCTURED_LAUNCH_OPTION_IDS,
+  STRUCTURED_LAUNCH_SEED_OPTION_IDS
+} from './native-chat-session-option-defaults'
+import { AGENT_CHAT_PERMISSION_MODE_OPTION_ID } from './agent-chat-permission-mode'
+import { usesInstalledAgentModelCatalog } from './agent-model-catalog-ownership'
+import {
+  structuredAgentSessionDescribedModel,
+  structuredAgentSessionShownModel
+} from './structured-agent-session-option-snapshot'
+import type { SessionOptionValue } from './native-chat-session-options'
 import type {
   AgentSessionModelCatalogResult,
   AgentSessionOptionsResult
@@ -26,50 +25,11 @@ import {
   encodeStructuredAgentSessionOptionValue
 } from './structured-agent-session-option-codec'
 
-function effortOption(model: AgentSessionOptionsResult['models'][number]): CatalogOption | null {
-  if (model.efforts.length <= 1) {
-    return null
-  }
-  return {
-    id: 'effort',
-    label: 'Reasoning effort',
-    category: 'thought_level',
-    kind: {
-      type: 'select',
-      choices: model.efforts,
-      defaultValue: model.defaultEffort ?? model.efforts[0]!.value,
-      ...(model.defaultEffort ? { defaultIsCliDefault: true as const } : {})
-    },
-    apply: { midSession: { kind: 'command', build: (value) => `/effort ${String(value)}` } }
-  }
-}
-
-function fastModeOption(): CatalogOption {
-  return {
-    id: 'fastMode',
-    label: 'Fast mode',
-    category: 'mode',
-    kind: { type: 'boolean', defaultValue: false },
-    apply: {}
-  }
-}
-
-function discoveredModel(
-  model: AgentSessionOptionsResult['models'][number],
-  sessionSupportsFastMode: boolean
-): CatalogModel {
-  const effort = effortOption(model)
-  return {
-    id: model.id,
-    label: model.label,
-    ...(model.description ? { description: model.description } : {}),
-    ...(model.isDefault ? { isDefault: true } : {}),
-    options: [
-      ...(effort ? [effort] : []),
-      ...(sessionSupportsFastMode && model.supportsFastMode === true ? [fastModeOption()] : [])
-    ]
-  }
-}
+export {
+  canSetStructuredAgentSessionOption,
+  lockedStructuredAgentSessionOptionSnapshot,
+  structuredAgentSessionOptionSnapshot
+} from './structured-agent-session-option-snapshot'
 
 export function structuredAgentSessionOptionCatalog(
   seed: AgentSessionOptionCatalog,
@@ -90,12 +50,24 @@ export function structuredAgentSessionOptionCatalog(
 
 export type StructuredAgentSessionOptionState = {
   catalog: AgentSessionOptionCatalog | null
-  /** What produced `catalog`; a weaker source never replaces a stronger one. `seed` is the
+  /** What answered `catalog`, not proof of current child eligibility. `seed` is the
    *  built-in list before the host answered (shown as the quiet placeholder); `builtin` is the
    *  same list once the host said it has none, usable but naming nothing the host may replace. */
   catalogSource: 'seed' | 'builtin' | 'host' | 'live' | null
-  record: NativeChatSessionOptionRecord
+  /** The rows of a live answer its agent's own listing names; a row outside them is the chat's
+   *  own model, which no list describes. Absent from an older host. */
+  verifiedModelIds?: readonly string[]
+  record: StructuredAgentSessionOptionRecord
+  /** The last answer came from a host that marks no defaults, whose own tier rule it shows. */
+  olderHost?: true
+  /** A resumed chat names the default its host marks but never sends it: its next start runs the
+   *  agent's own. A new chat sends the default it shows, so its first send pins it. */
+  defaultsUnsent?: true
+  /** The permission mode the host or launch last stated; null shows no picker. */
+  permissionMode: string | null
   pendingId: string | null
+  listingInProgress?: boolean
+  fastModeRestricted?: boolean
 }
 
 /** With `seedCatalog`, the state holds the static seed from the first frame, but the picker shows
@@ -107,7 +79,8 @@ export function createStructuredAgentSessionOptionState(
   return {
     catalog: seedCatalog ?? null,
     catalogSource: seedCatalog ? 'seed' : null,
-    record: createNativeChatSessionOptionRecord(agent),
+    record: createStructuredAgentSessionOptionRecord(agent),
+    permissionMode: null,
     pendingId: null
   }
 }
@@ -115,24 +88,55 @@ export function createStructuredAgentSessionOptionState(
 /** The host answered with no list (none saved, a failed read, or an older host): the built-in
  *  list becomes usable, still naming nothing until a host or session list does. */
 export function settleStructuredAgentSessionBuiltinCatalog(
-  state: StructuredAgentSessionOptionState
+  state: StructuredAgentSessionOptionState,
+  listingInProgress = state.listingInProgress
 ): StructuredAgentSessionOptionState {
-  return state.catalogSource === 'seed' ? { ...state, catalogSource: 'builtin' } : state
+  const catalogSource = state.catalogSource === 'seed' ? 'builtin' : state.catalogSource
+  return catalogSource === state.catalogSource && state.listingInProgress === listingInProgress
+    ? state
+    : { ...state, catalogSource, listingInProgress }
+}
+
+function isListedModelRow(row: unknown): row is { id: string } {
+  return (
+    typeof row === 'object' &&
+    row !== null &&
+    'id' in row &&
+    typeof row.id === 'string' &&
+    'efforts' in row &&
+    Array.isArray(row.efforts)
+  )
+}
+
+/** The ids a finished listing names; undefined for one still running, failed, empty or malformed. */
+export function finishedListingIds(catalog: AgentSessionModelCatalogResult): string[] | undefined {
+  const rows: unknown = catalog.origin === 'unknown' ? null : catalog.models
+  return Array.isArray(rows) &&
+    rows.length > 0 &&
+    rows.every(isListedModelRow) &&
+    !catalog.listingInProgress &&
+    !catalog.unavailable
+    ? rows.map((row) => row.id)
+    : undefined
 }
 
 /**
  * Applies the host's stored model catalog: models only, no current selection
  * and no record writes, so nothing here reads as a committed value — the pick
- * stays provisional until a live options result confirms it. A live catalog
- * is never downgraded by this.
+ * stays provisional until an options result confirms it.
  */
 export function applyStructuredAgentSessionModelCatalog(
   state: StructuredAgentSessionOptionState,
   seed: AgentSessionOptionCatalog,
   catalog: AgentSessionModelCatalogResult,
-  options: { newLaunch: boolean }
+  options: { newLaunch: boolean; coherentCatalog?: boolean }
 ): StructuredAgentSessionOptionState {
-  if (state.catalogSource === 'live') {
+  const installed = usesInstalledAgentModelCatalog(state.record.agent, options.coherentCatalog)
+  const listingInProgress = installed && catalog.listingInProgress === true
+  if (Boolean(state.listingInProgress) !== listingInProgress) {
+    state = { ...state, listingInProgress }
+  }
+  if (state.catalogSource === 'live' && !installed) {
     return state
   }
   const models =
@@ -141,7 +145,7 @@ export function applyStructuredAgentSessionModelCatalog(
       : catalog.models.map((model) =>
           discoveredModel(model, catalog.fastModeSupport?.supported === true)
         )
-  if (catalog.origin === 'unknown' || models.length === 0) {
+  if (catalog.origin === 'unknown' || (!installed && models.length === 0)) {
     return settleStructuredAgentSessionBuiltinCatalog(state)
   }
   // The host says whether its listed default is what this launch runs; an older host never says,
@@ -154,100 +158,68 @@ export function applyStructuredAgentSessionModelCatalog(
     // `isDefault` came from a real listing, so a launch's CLI default is nameable —
     // as a provisional `default`-source value, never a confirmed one.
     catalog: {
-      ...seed,
+      ...(state.catalogSource === 'live' ? (state.catalog ?? seed) : seed),
       models,
       ...(namesDefault ? { defaultModelIsCliDefault: true } : {})
     },
-    catalogSource: 'host'
+    ...(installed ? { verifiedModelIds: finishedListingIds(catalog) } : {}),
+    catalogSource: state.catalogSource === 'live' ? 'live' : 'host'
   }
 }
 
 export function applyStructuredAgentSessionOptions(
   state: StructuredAgentSessionOptionState,
   seed: AgentSessionOptionCatalog,
-  result: AgentSessionOptionsResult
+  result: AgentSessionOptionsResult,
+  /** Whether this view started the chat, which runs the default it shows until its first send.
+   *  Absent reads as a chat it did not start, which never names a default as its own. */
+  launch: { newLaunch: boolean; coherentCatalog?: boolean } = { newLaunch: false }
 ): StructuredAgentSessionOptionState {
-  if (result.current.fastMode === undefined) {
-    clearTrackedSessionOption(state.record, result.current.model ?? null, 'fastMode')
-  }
-  applyNativeChatReportedSessionOptions(
+  const { current } = result
+  const installed = usesInstalledAgentModelCatalog(state.record.agent, launch.coherentCatalog)
+  // A value the host supplied from a catalog default is context for the picker, not the chat's own.
+  replaceStructuredAgentSessionAnsweredValues(
     state.record,
     {
-      ...(result.current.model ? { model: result.current.model } : {}),
-      ...(result.current.effort ? { effort: result.current.effort } : {}),
-      ...(result.current.fastMode !== undefined ? { fastMode: result.current.fastMode } : {})
+      ...(current.model ? { model: current.model } : {}),
+      ...(current.effort ? { effort: current.effort } : {}),
+      ...(current.fastMode !== undefined ? { fastMode: current.fastMode } : {}),
+      ...(current.serviceTier ? { serviceTier: current.serviceTier } : {})
     },
-    result.current.confirmed ?? []
+    (id) =>
+      current.defaulted?.some((key) => key === id)
+        ? 'default'
+        : current.confirmed?.includes(id)
+          ? 'reported'
+          : 'dispatched'
   )
   return {
     ...state,
-    catalog: structuredAgentSessionOptionCatalog(seed, result),
-    catalogSource: 'live'
+    catalog: installed ? state.catalog : structuredAgentSessionOptionCatalog(seed, result),
+    fastModeRestricted:
+      installed &&
+      result.fastModeSupport?.supported === false &&
+      result.fastModeSupport.reason !== 'model-not-supported',
+    catalogSource: installed && state.catalogSource === 'seed' ? 'seed' : 'live',
+    olderHost: current.defaulted === undefined ? true : undefined,
+    defaultsUnsent: current.defaulted !== undefined && !launch.newLaunch ? true : undefined,
+    verifiedModelIds: installed
+      ? state.verifiedModelIds
+      : result.listedModelIds?.length
+        ? result.listedModelIds
+        : undefined,
+    permissionMode: result.current.permissionMode ?? null
   }
 }
 
-/** Before the host answers, or an agent with no list reports, the quiet model pill: never
- *  pickable, so displaying it can never become a launch pick. */
-const PROVIDER_DEFAULT_MODEL_PLACEHOLDER: SessionOptionDescriptor = {
-  id: 'model',
-  label: 'Model',
-  category: 'model',
-  kind: { type: 'select', choices: [] },
-  valueSource: 'unknown',
-  transport: 'agent-session',
-  settable: false,
-  disabledReason: 'available-after-session-start'
-}
-
-export function structuredAgentSessionOptionSnapshot(
+/** The model a pick's other values were chosen under: the chat's own, else the default shown. */
+function structuredAgentSessionControlsModelId(
   state: StructuredAgentSessionOptionState
-): SessionOptionDescriptor[] {
-  if (!state.catalog) {
-    return []
-  }
-  // Until the host answers, the built-in list would paint a label its list may replace.
-  if (state.catalogSource === 'seed') {
-    return [PROVIDER_DEFAULT_MODEL_PLACEHOLDER]
-  }
-  const snapshot = buildNativeChatSessionOptionSnapshot({
-    catalog: state.catalog,
-    // A seeded default can name a model the static seed does not list yet.
-    models: withTrackedNativeChatModel(state.catalog, state.catalog.models, state.record),
-    record: state.record,
-    mode: 'live',
-    modelLabel: 'Model',
-    liveTransport: 'agent-session'
-  })
-  return snapshot.length > 0 || state.catalogSource === 'live'
-    ? snapshot
-    : [PROVIDER_DEFAULT_MODEL_PLACEHOLDER]
-}
-
-/** No launch holds a pick and no fence can carry one yet, so the picker only shows. */
-export function lockedStructuredAgentSessionOptionSnapshot(
-  snapshot: readonly SessionOptionDescriptor[]
-): SessionOptionDescriptor[] {
-  return snapshot.map((descriptor) => ({
-    ...descriptor,
-    settable: false,
-    disabledReason: 'available-after-session-start'
-  }))
-}
-
-export function canSetStructuredAgentSessionOption(
-  state: StructuredAgentSessionOptionState,
-  id: string,
-  value: SessionOptionValue
-): boolean {
-  const descriptor = structuredAgentSessionOptionSnapshot(state).find((entry) => entry.id === id)
-  return Boolean(
-    state.catalog &&
-    state.pendingId === null &&
-    ((typeof value === 'string' &&
-      descriptor?.kind.type === 'select' &&
-      descriptor.kind.choices.some((choice) => choice.value === value)) ||
-      (typeof value === 'boolean' && descriptor?.kind.type === 'boolean'))
-  )
+): string | null {
+  return state.catalog
+    ? structuredAgentSessionShownModel(state.catalog, state.catalog.models, state.record)
+        .controlsModelId
+    : null
 }
 
 export function commitStructuredAgentSessionOption(
@@ -255,20 +227,38 @@ export function commitStructuredAgentSessionOption(
   id: string,
   value: string
 ): StructuredAgentSessionOptionState {
+  if (id === AGENT_CHAT_PERMISSION_MODE_OPTION_ID) {
+    return { ...state, permissionMode: value, pendingId: null }
+  }
   if (!state.catalog) {
     return state
   }
-  const effectiveModel = resolveEffectiveNativeChatModelId(
-    state.catalog,
-    state.catalog.models,
-    state.record
-  )
   const decoded = decodeStructuredAgentSessionOptionValue(id, value)
   if (decoded === null) {
     return { ...state, pendingId: null }
   }
-  setTrackedSessionOption(state.record, id, decoded, 'dispatched', effectiveModel)
+  // Each value is the chat's own: a model pick leaves the others for the host to reconcile.
+  state.record.values[id] = { value: decoded, source: 'dispatched' }
   return { ...state, pendingId: null }
+}
+
+/** Whether a pick of `modelId` held before launch keeps another held value (decoded or encoded):
+ *  no host exists yet to reconcile it, so only what the model's controls offer stays. A model the
+ *  list does not describe keeps every value, since nothing says what it takes. */
+export function structuredAgentSessionModelOffers(
+  state: Pick<StructuredAgentSessionOptionState, 'catalog' | 'verifiedModelIds'>,
+  modelId: string,
+  id: string,
+  value: SessionOptionValue
+): boolean {
+  const model = structuredAgentSessionDescribedModel(state, modelId)
+  if (id === 'model' || id === AGENT_CHAT_PERMISSION_MODE_OPTION_ID || !model) {
+    return true
+  }
+  const option = model.options.find((entry) => entry.id === id)
+  return option?.kind.type === 'select'
+    ? option.kind.choices.some((choice) => choice.value === value)
+    : option !== undefined
 }
 
 export function commitStructuredAgentSessionOptionValues(
@@ -276,7 +266,7 @@ export function commitStructuredAgentSessionOptionValues(
   values: Readonly<Record<string, string>>
 ): StructuredAgentSessionOptionState {
   let next = state
-  for (const id of STRUCTURED_LAUNCH_SEED_OPTION_IDS) {
+  for (const id of STRUCTURED_LAUNCH_OPTION_IDS) {
     const value = values[id]
     if (value !== undefined) {
       next = commitStructuredAgentSessionOption(next, id, value)
@@ -316,7 +306,7 @@ export function structuredAgentSessionOptionPicks(
   const modelId =
     typeof committedModel === 'string' && committedModel.trim()
       ? committedModel
-      : resolveEffectiveNativeChatModelId(state.catalog, state.catalog.models, state.record)
+      : structuredAgentSessionControlsModelId(state)
   if (!modelId) {
     return []
   }

@@ -20,7 +20,6 @@ import {
   ensureRuntimeDirectory,
   uploadRuntimeFileWithoutClobber
 } from './runtime-file-upload-client'
-import { getActiveRuntimeTarget } from './runtime-rpc-client'
 import { toRuntimeWorktreeSelector } from './runtime-worktree-selector'
 import type { LocalFileAccess } from '../../../shared/local-file-access'
 import { localAccess } from './runtime-file-read-client'
@@ -34,9 +33,11 @@ export async function importExternalPathsToRuntime(
     assertCurrent?: () => void
     /** Local imports only; remote destinations stay root-relative. */
     access?: LocalFileAccess
+    /** Remote `.orca/drops` uploads: name an extensionless image by its bytes. */
+    nameExtensionlessImages?: boolean
   }
 ): Promise<{ results: ImportItemResult[] }> {
-  const target = getActiveRuntimeTarget(context.settings)
+  const target = context.target
   if (target.kind !== 'environment' || !context.worktreeId || !context.worktreePath) {
     return window.api.fs.importExternalPaths(
       withSshMutationExpectation(context, {
@@ -78,7 +79,10 @@ export async function importExternalPathsToRuntime(
     assertCurrent: assertImportSessionCurrent
   }
   importSession.assertCurrent()
-  const staged = await window.api.fs.stageExternalPathsForRuntimeUpload({ sourcePaths })
+  const staged = await window.api.fs.stageExternalPathsForRuntimeUpload({
+    sourcePaths,
+    nameExtensionlessImages: options?.nameExtensionlessImages
+  })
   importSession.assertCurrent()
   const results: ImportItemResult[] = []
   const reservedNames = new Set<string>()

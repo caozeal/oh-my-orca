@@ -1,24 +1,21 @@
 /**
  * The two things a supervisor reads off a launch: what the arguments mean, and what an exit
- * code means. Both are part of the ops contract in docs/reference/orcad-operations.md.
+ * code means. Both are part of the supervisor ops contract.
  */
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { parseArgs } from './orcad-entry'
-import {
-  ORCAD_EXIT_CONFIGURATION,
-  ORCAD_EXIT_FAILED,
-  resolveOrcadExitCode
-} from './orcad-exit-code'
+import { parseArgs } from './orcad-command-arguments'
+import { ORCAD_EXIT_CONFIGURATION } from './orcad-configuration-exit'
+import { ORCAD_EXIT_FAILED, resolveOrcadExitCode } from './orcad-exit-code'
 import { startOrcadWithLifecycle } from './orcad-lifecycle'
 import {
   beginAgentSessionRuntimeRecord,
   readAgentSessionRuntimeEnds
 } from '../runtime/agent-session-runtime-end-record'
 import { OrcadBindAddressError } from './orcad-bind-address'
-import { OrcadInstanceLockError } from './orcad-instance-lock'
+import { OrcadInstanceLockError } from './orcad-data-root-privacy'
 import { ProfileStateAccessError } from '../persistence/profile-state/profile-state-access'
 import { OrcadBundledRuntimeError } from './orcad-bundled-runtime'
 
@@ -45,13 +42,20 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--help', '--port', 'bad'])).toThrow('--port expects an integer')
     expect(() => parseArgs(['--help', '--bind'])).toThrow('--bind expects a value')
     expect(() => parseArgs(['--help', '--recipe-json'])).toThrow(
-      '--recipe-json requires --project-root'
+      'Recipe JSON output requires --project-root.'
     )
     for (const flag of ['--no-pairing', '--mobile-pairing']) {
       expect(() => parseArgs(['--help', '--grant-desktop-control', flag])).toThrow(
         '--grant-desktop-control applies only to the default runtime pairing offer'
       )
     }
+  })
+
+  it('accepts the browser client directory orca serve hands it', () => {
+    expect(parseArgs(['--web-client-root', '/app/out/web'])).toEqual({
+      webClientRoot: '/app/out/web'
+    })
+    expect(() => parseArgs(['--web-client-root'])).toThrow('--web-client-root expects a value')
   })
 
   it('accepts --bind and leaves it unset when absent', () => {
@@ -65,22 +69,27 @@ describe('parseArgs', () => {
   })
 
   it('takes the desktop serve flags orca serve forwards', () => {
-    expect(
-      parseArgs([
-        '--mobile-pairing',
-        '--recipe-json',
-        '--project-root',
-        '/work/app',
-        '--no-pairing'
-      ])
-    ).toEqual({
-      mobilePairing: true,
+    expect(parseArgs(['--recipe-json', '--project-root', '/work/app'])).toEqual({
       recipeJson: true,
-      projectRoot: '/work/app',
-      noPairing: true
+      projectRoot: '/work/app'
     })
-    expect(() => parseArgs(['--recipe-json'])).toThrow('--recipe-json requires --project-root')
+    expect(parseArgs(['--mobile-pairing'])).toEqual({ mobilePairing: true })
+    expect(parseArgs(['--no-pairing'])).toEqual({ noPairing: true })
+    expect(() => parseArgs(['--recipe-json'])).toThrow(
+      'Recipe JSON output requires --project-root.'
+    )
     expect(() => parseArgs(['--project-root'])).toThrow('--project-root expects a value')
+  })
+
+  it('rejects contradictory pairing flags with the desktop serve message', () => {
+    expect(() => parseArgs(['--no-pairing', '--mobile-pairing'])).toThrow(
+      'Use either --mobile-pairing or --no-pairing, not both.'
+    )
+    for (const flag of ['--no-pairing', '--mobile-pairing']) {
+      expect(() => parseArgs(['--recipe-json', '--project-root', '/work/app', flag])).toThrow(
+        `Recipe JSON output requires runtime pairing; remove ${flag}.`
+      )
+    }
   })
 
   it('rejects --bind with no value rather than silently binding the default', () => {

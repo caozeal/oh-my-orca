@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { providerDiagnosticOf } from '../../shared/agent-session-failure'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { spawnProcess, type SpawnedProcess } from '../../shared/child-process/run-process'
-import type { ProcessSpec } from '../../shared/child-process/process-spec'
+import { spawnProcess } from '@orca/process-host'
+import type { SpawnedProcess, ProcessSpec } from '@orca/process-host/process-spec'
+
 import { query, type CanUseTool, type Options } from '@anthropic-ai/claude-agent-sdk'
 import {
   openClaudeStreamJsonConnection,
@@ -16,8 +17,6 @@ import { openAgentSessionJournal } from '../native-chat/agent-session-journal/jo
 import { createDeferredStructuredAgentSessionEventSink } from '../native-chat/agent-session-wire/structured-agent-session-event-sink'
 import { claudeAuthDiagnostic } from './claude-structured-init-proof'
 import { createClaudeJournalTranslator } from './claude-structured-journal-translation'
-import { readClaudeStructuredSessionOptions } from './claude-structured-session-options'
-import type { ClaudeSession } from './claude-structured-session-state'
 import { CLAUDE_STRUCTURED_BASE_OPTIONS } from './claude-structured-launch-resolution'
 import { openTestJournalHostDatabase } from '../native-chat/agent-session-journal/journal-host-database-test-support'
 import { testEventSinkLogging } from '../native-chat/agent-session-wire/structured-agent-session-logger-test-support'
@@ -218,6 +217,25 @@ describe('Claude stream-json connection', () => {
     expect(launchedArgv(spawned.at(-1))).toContain(FAKE_CLI)
     expect(report.argv).toContain('--replay-user-messages')
     expect(report.argv).toContain(`--session-id=${SESSION_ID}`)
+  })
+
+  it("strips the launch's inherited keys after Orca's own env is merged in", async () => {
+    vi.stubEnv('ORCA_PANE_KEY', 'tab-1:pane-1')
+    vi.stubEnv('ORCA_AGENT_HOOK_PORT', '4242')
+    vi.stubEnv('ORCA_CONNECTION_MARKER', 'inherited')
+    const scenario = scriptScenario([HOLD_OPEN])
+    await open({
+      ...launchFor(scenario, { ORCA_AGENT_SESSION_ID: 'f7a1c0de-1111-4222-8333-444455556666' }),
+      envToDelete: ['ORCA_PANE_KEY', 'ORCA_AGENT_HOOK_PORT']
+    })
+
+    await until(() => readReportSafely(scenario), 'the scripted CLI report')
+    const env = childEnv()
+    expect(env.ORCA_PANE_KEY).toBeUndefined()
+    expect(env.ORCA_AGENT_HOOK_PORT).toBeUndefined()
+    // Only the listed keys go: the rest of the inherited env and the launch's own still arrive.
+    expect(env.ORCA_CONNECTION_MARKER).toBe('inherited')
+    expect(env.ORCA_AGENT_SESSION_ID).toBe('f7a1c0de-1111-4222-8333-444455556666')
   })
 
   it('leaves the default CLI home unpinned so macOS Keychain OAuth keeps working', async () => {
@@ -515,48 +533,6 @@ describe('Claude stream-json connection', () => {
       { value: 'default', resolvedModel: 'claude-opus-5' },
       { value: 'opus', displayName: 'Opus 5', supportedEffortLevels: ['low', 'high'] }
     ])
-  })
-
-  it('serves the picker the live catalog rather than falling back to the static seed', async () => {
-    const scenario = scriptScenario([HOLD_OPEN], {
-      initialize: {
-        models: [
-          { value: 'default', resolvedModel: 'claude-opus-5' },
-          {
-            value: 'opus',
-            displayName: 'Opus 5',
-            description: 'The live row, not the seed',
-            resolvedModel: 'claude-opus-5',
-            supportsEffort: true,
-            supportedEffortLevels: ['low', 'high']
-          }
-        ]
-      }
-    })
-    const connection = await open(launchFor(scenario))
-    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the fixture supplies every session member the option paths under test read.
-    const session = {
-      connection,
-      options: new Map<string, string>(),
-      reportedOptions: {},
-      startup: { state: 'proven' }
-    } as unknown as ClaudeSession
-
-    const options = await readClaudeStructuredSessionOptions(session, 5_000)
-
-    // The seed carries neither this description nor a two-level effort list, so
-    // both can only have come from the child.
-    expect(options.models).toContainEqual({
-      id: 'opus',
-      label: 'Opus 5',
-      description: 'The live row, not the seed',
-      isDefault: true,
-      efforts: [
-        { value: 'low', label: 'Low' },
-        { value: 'high', label: 'High' }
-      ]
-    })
-    expect(options.current.model).toBe('opus')
   })
 
   it('feeds the auth diagnostic from the settings the running child reports', async () => {

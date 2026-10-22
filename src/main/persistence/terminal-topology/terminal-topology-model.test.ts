@@ -29,7 +29,7 @@ import {
 } from './terminal-topology-profile-fixture'
 
 vi.mock('../../telemetry/client', () => ({ track: vi.fn() }))
-vi.mock('../../ssh/ssh-config-parser', () => ({
+vi.mock('../../ssh/config/ssh-config-parser', () => ({
   loadUserSshConfig: () => ({ hosts: [] }),
   sshConfigHostsToTargets: () => []
 }))
@@ -304,7 +304,7 @@ async function runSeed(seed: number): Promise<string[]> {
       options,
       requestedSession: store.getWorkspaceSession(),
       ownerMatches: () => true,
-      hostId: () => LOCAL_EXECUTION_HOST_ID,
+      hostIds: () => [LOCAL_EXECUTION_HOST_ID],
       getSession: (hostId) => store.getWorkspaceSession(hostId),
       setSession: (session, hostId) => store.setWorkspaceSession(session, hostId),
       onClosed: () => {}
@@ -553,24 +553,33 @@ async function runSeed(seed: number): Promise<string[]> {
         const ptyId = ids.pty(worktreeId)
         const ticks = Math.floor(random() * 4)
         log.push(`${op} ${target.tabId}:${target.leafId} → ${leafId} ${ptyId} stale-save+${ticks}`)
-        // `terminal.split` from a client or the CLI: main mints the pane while the window's
-        // in-flight save lacks it.
+        // `terminal.split` from a client or the CLI: main writes the pane, then binds it, while
+        // the window's in-flight save lacks it.
+        writer = 'host split'
         const [bound] = await Promise.all([
-          store.persistPtyBinding(() => {
-            writer = 'host split'
-            return {
-              worktreeId,
+          store
+            .admitTerminalPane({
+              type: 'splitPane',
+              workspace: worktreeId,
               tabId: target.tabId,
-              leafId,
-              ptyId,
-              hostAdmittedMembership: true,
-              expectedSourceBinding: {
+              leafId: target.leafId,
+              direction: 'vertical',
+              newLeafId: leafId
+            })
+            .then(() =>
+              store.persistPtyBinding({
+                worktreeId,
                 tabId: target.tabId,
-                leafId: target.leafId,
-                ptyId: target.pane.ptyId!
-              }
-            }
-          }),
+                leafId,
+                ptyId,
+                mayCreate: false,
+                expectedSourceBinding: {
+                  tabId: target.tabId,
+                  leafId: target.leafId,
+                  ptyId: target.pane.ptyId!
+                }
+              })
+            ),
           staleSave(window.snapshot(), ticks)
         ])
         expect(bound).toBe(true)

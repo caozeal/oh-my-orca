@@ -59,7 +59,6 @@ vi.mock('electron', () => ({
 vi.mock('../window/foreground-activation-policy', () => ({
   isBackgroundLaunch: mocks.backgroundLaunch
 }))
-vi.mock('@electron-toolkit/utils', () => ({ is: { dev: true } }))
 vi.mock('./cli-launch-redirect', () => ({
   maybeRedirectCliLaunch: () => ({ redirected: false, status: 0 })
 }))
@@ -187,7 +186,7 @@ vi.mock('../crash-reporting/main-process-lifecycle-identity')
 vi.mock('./ensure-virtual-display', () => ({
   ensureVirtualDisplayForHeadlessServe: vi.fn(),
   hasUsableLinuxDisplay: () => true,
-  MISSING_LINUX_DISPLAY_MESSAGE: 'missing display'
+  missingLinuxDisplayMessage: () => 'missing display'
 }))
 vi.mock('./gpu-lifecycle')
 vi.mock('./main-process-state', () => ({ mainProcessState: {} }))

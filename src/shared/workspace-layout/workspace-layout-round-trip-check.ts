@@ -42,7 +42,7 @@ export const KNOWN_LOAD_CHANGES: ReadonlySet<string> = new Set([
   'group.recentTabIds',
   'row.title',
   'row.ptyId',
-  // Transient handoffs main's minimal row mint stores; never restored.
+  // Transient handoffs older builds' minimal row mint stored; never restored.
   'row.pendingActivationSpawn',
   'row.recovery',
   'row.customTitle',
@@ -68,6 +68,7 @@ export const KNOWN_LOAD_CHANGES: ReadonlySet<string> = new Set([
     'chatLeafId',
     'ptyIdsByLeafId',
     'titlesByLeafId',
+    'lastGridsByLeafId',
     'buffersByLeafId',
     'scrollbackRefsByLeafId'
   ].map((field) => `layout.${field}`),

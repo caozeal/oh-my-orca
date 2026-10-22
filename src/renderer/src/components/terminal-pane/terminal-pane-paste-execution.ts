@@ -1,11 +1,12 @@
 import { useAppStore } from '../../store'
 import type { ManagedPane } from '@/lib/pane-manager/pane-manager'
-import type { PtyTransport } from './pty-transport'
+import type { PtyTransport } from './pty-transport-types'
 import { getConnectionId } from '@/lib/connection-context'
-import { getRuntimeEnvironmentIdForWorktree } from '@/lib/worktree-runtime-owner'
-import type { TerminalPasteSource, TerminalPasteTextOptions } from './terminal-paste-coordinator'
-import { resolveTerminalPasteRuntime } from './terminal-paste-runtime'
-import { getTerminalPasteSshRemotePlatform } from './terminal-paste-ssh-platform'
+import type { TerminalPasteSource, TerminalPasteTextOptions } from './terminal-paste-model'
+import {
+  resolveTerminalPasteRuntime,
+  resolveTerminalPasteRuntimeEnvironmentId
+} from './terminal-paste-runtime'
 import {
   isTerminalPanePasteFocusCurrent,
   isTerminalPanePasteTargetCurrent
@@ -58,7 +59,6 @@ export function createTerminalPanePasteExecution(
     text: string,
     options?: TerminalPasteTextOptions
   ): Promise<void> => {
-    const connectionId = getConnectionId(worktreeId) ?? null
     const transport = paneTransportsRef.current.get(pane.id)
     const ptyId = transport?.getPtyId() ?? null
     const keyboardOwnedPaste =
@@ -71,8 +71,6 @@ export function createTerminalPanePasteExecution(
       runtime: resolveTerminalPasteRuntime({
         platform: shortcutPlatform,
         ptyId,
-        connectionId,
-        remotePlatform: getTerminalPasteSshRemotePlatform(connectionId),
         transport,
         isWindowsConpty: forceBracketedMultilineTextPaste
       }),
@@ -110,9 +108,10 @@ export function createTerminalPanePasteExecution(
       .readClipboardText
   ): void => {
     const connectionId = getConnectionId(worktreeId) ?? null
-    const runtimeEnvironmentId = getRuntimeEnvironmentIdForWorktree(
+    const runtimeEnvironmentId = resolveTerminalPasteRuntimeEnvironmentId(
       useAppStore.getState(),
-      worktreeId
+      worktreeId,
+      paneTransportsRef.current.get(pane.id)
     )
     const activeElementAtDispatch = document.activeElement
     void pasteTerminalClipboard({

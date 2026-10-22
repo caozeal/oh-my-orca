@@ -1,7 +1,6 @@
 import { app, nativeTheme } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
-import { is } from '@electron-toolkit/utils'
 import { StarNagService } from '../star-nag/service'
 import { AgentBrowserBridge } from '../browser/agent-browser-bridge'
 import { EmulatorBridge } from '../emulator/emulator-bridge'
@@ -15,16 +14,12 @@ import { handleGpuChildCrash } from './gpu-lifecycle'
 import { isGpuFallbackCrashCandidate } from '../crash-reporting/gpu-crash-fallback-decision'
 import { startCodexHooks } from '../codex/codex-hook-reconcile'
 import { hydrateAgentCliShellPath } from '../agent-hooks/local-agent-cli-presence'
-import {
-  installManagedAgentHooks,
-  isAgentStatusHooksEnabledForAgent,
-  resolveStartupManagedHookAction,
-  shouldContinueManagedHookStartup
-} from '../agent-hooks/managed-agent-hook-controls'
+import { isAgentStatusHooksEnabledForAgent } from '../agent-hooks/managed-agent-hook-controls'
+import { reconcileStartupManagedAgentHooks } from '../agent-hooks/managed-agent-hook-startup'
 import { shouldInstallManagedHooks } from './configure-process'
-import { recordManagedHookInstallFailure } from '../agent-hooks/install-telemetry'
 import { mainProcessState as state } from './main-process-state'
 import { initializeMainProcessObservers } from './main-process-observers'
+import { installFirstWorkRenameHookSubscription } from './branch-rename-hook'
 import { initializeMainProcessAccountServices } from './main-process-account-services'
 import {
   initializeMainProcessRuntime,
@@ -38,6 +33,8 @@ import { runAfterFirstWindowShown } from './first-window-deferral'
 import { logStartupMilestone } from './startup-diagnostics'
 import { refreshInstalledOpenCodeStatusPlugins } from '../opencode/opencode-status-plugin-startup-refresh'
 import { pruneDesktopOrcadArtifactCache } from '../orcad/orcad-artifact-cache-retention'
+import { ORCA_LAYOUT_OWNER_IS_MAIN } from '../../shared/layout-owner-switch'
+import { repairDuplicatePtyPanesOnStart } from '../runtime/moved-pane-owner-rekey'
 
 // Headless serve never opens a window, so the sweep still has to run off a timer there.
 const WORKTREE_TRASH_SWEEP_FALLBACK_MS = 15_000
@@ -54,6 +51,7 @@ export async function initializeReadyRuntimeServices(): Promise<void> {
   const runtime = initializeMainProcessRuntime()
   initializeMainProcessAutomations()
   configureRuntimeServices(runtime)
+  installFirstWorkRenameHookSubscription()
   await initializeMainProcessPlugins(runtime)
   state.starNag = new StarNagService(store, state.stats!)
   state.starNag.start()
@@ -117,23 +115,12 @@ export async function initializeReadyRuntimeServices(): Promise<void> {
       return state.codexRuntimeHome.resolveHostCodexHomePathForLaunchReadOnly()
     }
   })
-  const startupManagedHookSettings = store.getSettings()
-  const shouldReconcileStartupManagedHooks =
-    shouldInstallManagedHooks(is.dev) &&
-    resolveStartupManagedHookAction(startupManagedHookSettings) === 'install'
-  // Why skip rather than remove when the off switch is set: the hook files are user-global but this
-  // decision reads only THIS profile's settings, so removing here deletes the hooks every other Orca
-  // instance depends on (STA-5679). Skipping already keeps removed hooks from reappearing on launch.
-  if (shouldReconcileStartupManagedHooks) {
-    const managedHookStore = store
-    void installManagedAgentHooks(managedHookStore.getSettings(), {
-      shouldHydrateShellPath: app.isPackaged,
-      onInstallError: recordManagedHookInstallFailure,
-      shouldContinue: (agent) =>
-        shouldContinueManagedHookStartup(state.isQuitting, managedHookStore.getSettings(), agent)
-    }).catch((error: unknown) =>
-      console.warn('[agent-hooks] failed to reconcile managed hooks on startup:', error)
-    )
+  if (shouldInstallManagedHooks(!app.isPackaged)) {
+    reconcileStartupManagedAgentHooks({
+      getSettings: () => store.getSettings(),
+      isQuitting: () => state.isQuitting,
+      shouldHydrateShellPath: app.isPackaged
+    })
   }
   // Why: process-gone metrics only see survivors, and the gone-time host memory
   // read lands after the corpse released its pages; both need a live pre-gone
@@ -157,5 +144,9 @@ export async function initializeReadyRuntimeServices(): Promise<void> {
       void handleGpuChildCrash(details.reason, details.exitCode ?? null, crashedAt)
     }
   })
+  // Switch point: awaited, as it queues behind in-flight writes and every later phase must read its tree.
+  if (ORCA_LAYOUT_OWNER_IS_MAIN) {
+    await repairDuplicatePtyPanesOnStart(store, runtime)
+  }
   logStartupMilestone('services-initialized')
 }

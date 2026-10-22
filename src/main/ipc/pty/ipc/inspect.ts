@@ -11,12 +11,12 @@ import { ptyOwnership } from '../provider/ownership-state'
 import {
   getProviderForPty,
   getProvider,
-  getPtySshConnectionId,
   hasPtyProviderForInspection,
   isDispatchablePtyHost,
   registeredPtyProviders,
   resolvePtyExecutionHost,
-  tryGetProviderForPty
+  tryGetProviderForPty,
+  type ResolvedPtyHost
 } from '../provider/registry'
 import {
   getConnectionExecutionHostId,
@@ -32,7 +32,7 @@ import {
 } from '../pane/serializer-state'
 
 export function installPtyInspectIpcHandlers(deps: {
-  getLocalPtyProviderStartupPromise: (connectionId?: string | null) => Promise<void> | undefined
+  getLocalPtyProviderStartupPromise: (hostId?: ResolvedPtyHost) => Promise<void> | undefined
 }): void {
   const ipcMain = getPtyIpc()
   const { getLocalPtyProviderStartupPromise } = deps
@@ -42,7 +42,7 @@ export function installPtyInspectIpcHandlers(deps: {
   // renderer-kill.ts inlines this — pty:kill's listener teardown is
   // ordering-sensitive and must not gain even a no-barrier microtask.
   const awaitSwapWindow = async (id: string): Promise<void> => {
-    await getLocalPtyProviderStartupPromise(getPtySshConnectionId(id))
+    await getLocalPtyProviderStartupPromise(resolvePtyExecutionHost(id))
   }
 
   ipcMain.handle(
@@ -163,7 +163,11 @@ export function installPtyInspectIpcHandlers(deps: {
       return null
     }
     try {
-      return provider.hasPty(args.id)
+      if (provider.hasPty(args.id)) {
+        return true
+      }
+      // Why: hasPty only knows sessions attached this run, so a session that survived a restart reads absent until the host answers.
+      return provider.probePtyLiveness ? await provider.probePtyLiveness(args.id) : false
     } catch {
       // Why: liveness is only allowed to close panes on an authoritative false.
       return null

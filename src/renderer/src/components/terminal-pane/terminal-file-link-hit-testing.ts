@@ -1,3 +1,4 @@
+import { dedupeLogicalLines } from './terminal-link-logical-line-deduplication'
 import type { IBufferLine, IBufferRange } from '@xterm/xterm'
 import { extractTerminalFileLinkCandidates } from '@/lib/terminal-links'
 import { openDetectedFilePath } from './terminal-file-open-routing'
@@ -16,8 +17,10 @@ type FileLinkHitTestDeps = {
   worktreePath: string
   runtimeEnvironmentId?: string | null
   wslDistro?: string | null
+  terminalHandle?: string | null
   pathExistsCache?: Map<string, boolean>
   openWithSystemDefault?: boolean
+  sourceTabId?: string | null
 }
 
 export function openFilePathLinkAtBufferPosition(
@@ -96,17 +99,6 @@ export function buildCandidateLogicalLinesForBufferPosition(
     ? [...hardWrappedCandidates, softWrappedLogicalLine]
     : hardWrappedCandidates
   return dedupeLogicalLines(candidates)
-}
-
-export function dedupeLogicalLines(logicalLines: WrappedLogicalLine[]): WrappedLogicalLine[] {
-  const seen = new Set<string>()
-  return logicalLines.filter((logicalLine) => {
-    if (seen.has(logicalLine.fingerprint)) {
-      return false
-    }
-    seen.add(logicalLine.fingerprint)
-    return true
-  })
 }
 
 function rangeContainsBufferPosition(

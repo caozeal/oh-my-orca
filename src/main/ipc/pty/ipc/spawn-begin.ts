@@ -1,9 +1,11 @@
+import { ptyIncarnationById, ptyOwnership } from '../provider/ownership-state'
+import { attachOnlyViewOf } from '../pane/attach-only-view'
 import { isTerminalLeafId, makePaneKey } from '../../../../shared/stable-pane-id'
 import { resolveAgentLaunchPaneVerdict } from '../../../agent-launch/agent-launch-pane-attachment'
 import { AGENT_LAUNCH_PANE_REFUSED_CODE } from '../../../../shared/agent-launch-pane-verdict'
-import { agentLaunchPaneEvidence } from '../pane/agent-launch-pane-evidence'
+import { agentLaunchPaneLiveness } from '../pane/agent-launch-pane-evidence'
 import { isValidTerminalTabId } from '../../../../shared/terminal-tab-id'
-import type { PtySpawnResult } from '../../../providers/types'
+import type { PtySpawnResult } from '../../../providers/pty-provider-contract'
 import type { CodexPaneHomeRoute } from '../../../codex/codex-pane-account-registry'
 import { createPtySpawnTiming } from '../../pty-spawn-timing'
 import { allocatePtyLifecycleSequence } from '../host-env/types'
@@ -11,12 +13,10 @@ import { snapshotCodexPaneHomeRoutes } from '../host-env/codex-home'
 import { getAppPtyId } from '../provider/registry'
 import {
   makePaneSpawnReservationKey,
-  reservePaneSpawn,
-  paneSpawnReservationsByOwnerKey,
   pendingRuntimePaneCreatesByOwnerKey
 } from '../pane/spawn-reservation'
 import { resolveStablePaneOwner } from '../pane/stable-owner'
-import { excludeReplacedPaneOwner } from '../pane/pane-owner-replacement'
+import { excludeReplacedPaneOwner } from '../pane/replaced-pane-owner'
 import type { PtyIpcSpawnState } from './spawn-state'
 import type { PtySpawnIpcArgs } from './spawn-types'
 
@@ -48,7 +48,7 @@ export async function beginPtyIpcSpawn(
     launchPaneKey && args.worktreeId && args.tabId && args.leafId
       ? resolveAgentLaunchPaneVerdict(
           { worktreeId: args.worktreeId, paneKey: launchPaneKey },
-          agentLaunchPaneEvidence(ctx.deps, {
+          agentLaunchPaneLiveness(ctx.deps, {
             worktreeId: args.worktreeId,
             tabId: args.tabId,
             leafId: args.leafId,
@@ -109,13 +109,21 @@ export async function beginPtyIpcSpawn(
       ? pendingRuntimePaneCreatesByOwnerKey.get(earlyReservationKey)
       : undefined
     if (pendingRuntimeCreate) {
-      await pendingRuntimeCreate.promise
-    }
-    const existingPaneSpawn = earlyReservationKey
-      ? paneSpawnReservationsByOwnerKey.get(earlyReservationKey)
-      : undefined
-    if (existingPaneSpawn) {
-      return { ...(await existingPaneSpawn.promise), isReattach: true }
+      const created = await pendingRuntimeCreate.promise
+      // Why: main's start of this pane carries the payload a view paints from; attaching to the
+      // provider again adds a round trip. A start that carries none, or no longer owns its
+      // terminal, leaves the view to attach as today.
+      if (
+        attachOnlyViewOf(args) &&
+        created &&
+        created.id === args.sessionId &&
+        (created.coldRestore || typeof created.snapshot === 'string') &&
+        ptyOwnership.has(created.id) &&
+        (created.incarnationId === undefined ||
+          ptyIncarnationById.get(created.id) === created.incarnationId)
+      ) {
+        return created
+      }
     }
   }
   ctx.earlyStablePaneOwner =
@@ -134,9 +142,7 @@ export async function beginPtyIpcSpawn(
   ctx.earlyWorktreeId = args.worktreeId
   // Reserve early so renderer/runtime materialization cannot start duplicate provider spawns.
   ctx.paneSpawnReservationKey = earlyReservationKey
-  ctx.paneSpawnReservation =
-    heldReservation ??
-    (ctx.paneSpawnReservationKey ? reservePaneSpawn(ctx.paneSpawnReservationKey) : null)
+  ctx.paneSpawnReservation = heldReservation ?? null
   ctx.finishTerminalInstall = (): void => {}
   ctx.stablePaneOwner = null
   ctx.stablePaneBindingPersisted = false

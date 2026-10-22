@@ -1,10 +1,11 @@
 import { prepareQuickOpenFiles, rankQuickOpenFiles } from '../../../shared/quick-open-path-search'
 import { statUserOpenedPath } from '@/lib/user-opened-local-path'
 import { detectLanguage } from '@/lib/language-detect'
+import { openWorkspaceFile } from '@/lib/workspace-file-open'
 import { joinPath, getRelativePathInsideRoot } from '@/lib/path'
 import { useAppStore } from '@/store'
-import { isMissingRuntimePathError } from '@/runtime/runtime-file-client'
-import { getActiveRuntimeTarget, callRuntimeRpc } from '@/runtime/runtime-rpc-client'
+import { isMissingRuntimePathError } from '@/runtime/runtime-file-metadata-client'
+import { callRuntimeRpc } from '@/runtime/runtime-rpc-client'
 import { toRuntimeWorktreeSelector } from '@/runtime/runtime-worktree-selector'
 import type { RuntimeTerminalPathResolution } from '../../../shared/runtime-file-contracts'
 import { resolveWslRepoWorktreeBasePath } from '../../../shared/wsl-paths'
@@ -36,7 +37,7 @@ export async function openQuickOpenFile(
   }
   assertCurrent()
   const route = guard.route
-  const target = getActiveRuntimeTarget(route.settings)
+  const target = route.target
   const resolvePastedPath = (path: string): string =>
     target.kind !== 'environment' &&
     !route.connectionId &&
@@ -120,28 +121,27 @@ export async function openQuickOpenFile(
     }
   }
   assertCurrent()
-  const store = useAppStore.getState()
-  const fileId = store.openFile({
-    filePath,
-    relativePath,
-    worktreeId,
-    runtimeEnvironmentId: route.settings.activeRuntimeEnvironmentId,
-    ...(route.connectionId && getRelativePathInsideRoot(filePath, root) === null
-      ? { externalSshTargetId: route.connectionId }
-      : {}),
-    language: detectLanguage(filePath),
-    mode: 'edit'
+  const revealLine = literalSelected ? undefined : navigation.line
+  const opened = openWorkspaceFile({
+    kind: 'file',
+    intent: revealLine === undefined ? 'default' : 'source',
+    file: {
+      filePath,
+      relativePath,
+      worktreeId,
+      runtimeEnvironmentId: target.kind === 'environment' ? target.environmentId : null,
+      ...(route.connectionId && getRelativePathInsideRoot(filePath, root) === null
+        ? { externalSshTargetId: route.connectionId }
+        : {}),
+      language: detectLanguage(filePath),
+      mode: 'edit'
+    }
   })
-  if (!literalSelected && navigation.line !== undefined) {
+  if (revealLine !== undefined && opened.surface === 'editor') {
+    const fileId = opened.fileId
     if (detectLanguage(filePath) === 'markdown') {
       useAppStore.getState().setMarkdownViewMode(fileId, 'source')
     }
-    scheduleEditorLineReveal(
-      useAppStore.getState,
-      filePath,
-      navigation.line,
-      navigation.column,
-      fileId
-    )
+    scheduleEditorLineReveal(useAppStore.getState, filePath, revealLine, navigation.column, fileId)
   }
 }

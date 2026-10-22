@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { ActivityIndicator, Linking, Pressable, StyleSheet, Text, View } from 'react-native'
+import { Linking, Pressable, StyleSheet, Text, View } from 'react-native'
 import { useNavigation, useRouter } from 'expo-router'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import {
@@ -16,11 +16,8 @@ import type {
   MobileWebShellSessionState,
   MobileWebShellUpdateNotice
 } from './mobile-web-shell-session-contract'
-import {
-  formatMobileWebShellDevFacts,
-  isDevelopmentBuild,
-  useMobileWebShellDroppedFrames
-} from './mobile-web-shell-dev-facts'
+import { useMobileWebShellDroppedFrames } from './mobile-web-shell-dev-facts'
+import { ShellDevFacts } from './ShellDevFacts'
 import { cancelledShellNavigationTarget } from './cancelled-navigation-target'
 import { playPageHaptic } from './page-haptics'
 import { useMobileWebShellBridge } from './use-mobile-web-shell-bridge'
@@ -33,24 +30,29 @@ import { useMobileWebShellSession } from './use-mobile-web-shell-session'
 import { usePageHostSnapshot } from './use-page-host-snapshot'
 import { useReportedHostAreaServing } from './host-area-serving'
 import { isHostRouteOf } from './page-route-policy'
+import { PageRouteUnavailableScreen } from './PageRouteUnavailableScreen'
 import { useResponsiveLayout } from '../layout/responsive-layout'
 import { storageReadParamsSchema, type BridgeNativeVerb } from './bridge/bridge-native-verbs'
 import { SHELL_OPENING_LABEL, ShellPageCover, ShellWaitingFrame } from './ShellWaitingFrame'
+import { ShellDownloadProgress } from './ShellDownloadProgress'
+import { useReportedShellOverlayLoad, type ShellOverlayLoad } from './shell-overlay-load'
 import { pageSafeAreaInsets, usePublishedSafeAreaInsets } from './page-safe-area-insets'
+import { hostProfileUnreadableLine, pageFaultLine } from './shell-lifecycle-log'
+import { recordShellLifecycleLine } from './shell-lifecycle-line-recorder'
 
 function failureMessage(reason: MobileWebShellFailureCause): string {
   switch (reason) {
     case 'isolation-unavailable':
       return "This device's WebView is too old to open the workspace safely."
     case 'download-failed':
-      return 'The workspace could not be downloaded from this host.'
+      return 'The latest app could not be downloaded from this host.'
     case 'status-unreadable':
       return "Could not read this host's status. Go back and reopen it."
     case 'render-process-gone':
       return 'The workspace stopped responding.'
     case 'generation-unreadable':
     case 'document-load-failed':
-      return 'The downloaded workspace could not be opened.'
+      return 'The downloaded app could not be opened.'
   }
 }
 
@@ -59,7 +61,7 @@ function failureMessage(reason: MobileWebShellFailureCause): string {
 function updateNoticeMessage(notice: MobileWebShellUpdateNotice): string {
   switch (notice) {
     case 'update-failed':
-      return "Couldn't update the workspace from this host. Showing the last version that worked."
+      return "Couldn't download the latest app from this host. Showing the last version that worked."
   }
 }
 
@@ -71,18 +73,6 @@ function Waiting({ label }: { label: string }) {
   return (
     <Centered>
       <ShellWaitingFrame label={label} />
-    </Centered>
-  )
-}
-
-function Fetching({ state }: { state: Extract<MobileWebShellSessionState, { kind: 'fetching' }> }) {
-  return (
-    <Centered>
-      <ActivityIndicator color={colors.textSecondary} accessibilityLabel="Downloading workspace" />
-      <Text style={styles.waitingLabel}>Downloading workspace</Text>
-      <Text style={styles.progress} testID="mobile-web-shell-progress">
-        {`${state.completedAssets}/${state.totalAssets} files · ${state.receivedBytes}/${state.totalBytes} bytes`}
-      </Text>
     </Centered>
   )
 }
@@ -115,40 +105,15 @@ function Failed({
   )
 }
 
-function DevFacts({
-  state,
-  droppedBinaryFrames
-}: {
-  state: Extract<MobileWebShellSessionState, { kind: 'ready' }>
-  droppedBinaryFrames: number
-}) {
-  if (!isDevelopmentBuild()) {
-    return null
-  }
-  return (
-    <View style={styles.devFacts} pointerEvents="none">
-      <Text style={styles.devFactsText} testID="mobile-web-shell-dev-facts">
-        {formatMobileWebShellDevFacts({
-          buildId: state.buildId,
-          totalBytes: state.totalBytes,
-          elapsedMs: state.elapsedMs,
-          droppedBinaryFrames
-        })}
-      </Text>
-    </View>
-  )
-}
-
 export type MobileWebShellScreenProps = {
   hostId: string
+  /** Makes this an overlay: transparent over the screen that opened it, whose page draws a drawer.
+   *  The caller shows the wait and the exits; this shows nothing until the page has painted. */
+  onOverlayLoad?: (load: ShellOverlayLoad) => void
   /** The screen this shell stands in for, which the page cannot derive from a document served at `/`. */
   route: BridgeInitRoute
-  /**
-   * What to render when the bundle does not list this route, or lists it needing a grant this app
-   * does not implement. Required, because every caller has a native screen behind it: that is what
-   * the negotiation falls back to, and a shell with nothing behind it would paint a blank instead.
-   */
-  fallback: ReactNode
+  /** False for the catch-all, whose pathnames have no screen in this app. */
+  appNamesRoute?: boolean
   /**
    * The page applied a one-shot route param and asks for it to be erased (ruling 34), naming what
    * it applied. Only a caller that put one on the route ever hears this, and the comparison is
@@ -168,11 +133,13 @@ export type MobileWebShellScreenProps = {
 export function MobileWebShellScreen({
   hostId,
   route,
-  fallback,
+  appNamesRoute,
   onRouteParamClear,
+  onOverlayLoad,
   runtime
 }: MobileWebShellScreenProps) {
   const insets = useSafeAreaInsets()
+  const overlay = onOverlayLoad !== undefined
   const router = useRouter()
   const navigation = useNavigation()
   const popShellStack = useShellStackPop()
@@ -199,6 +166,7 @@ export function MobileWebShellScreen({
     hostId,
     routePathname: route.pathname,
     wide: isWideLayout,
+    appNamesRoute,
     runtime
   })
   // Full screen from the download on, as on a phone; while checking, nobody knows the page owns it.
@@ -256,6 +224,7 @@ export function MobileWebShellScreen({
     // handler on the other, and neither has anywhere to put a throw.
     onPageFault: (error) => {
       console.warn('[web-shell] the page faulted', error)
+      recordShellLifecycleLine(hostId, pageFaultLine(error))
       reportShellFailure('document-load-failed')
     },
     // The `init` this ready is answered with is already built from the app's writes, which reach
@@ -277,6 +246,7 @@ export function MobileWebShellScreen({
     // `document-load-failed` because that is what happens: the document loads and the page refuses
     // the session, so no tree is ever built. The refetch it costs is wasted on a route this shell
     // produced, and the second report is terminal, which is the failure screen this deserves.
+    // Logged by the host's `route-refused` diagnostic, which carries the issue, in the same call.
     onRouteRefused: (issue) => {
       console.warn('[web-shell] refused to open this screen', issue)
       reportShellFailure('document-load-failed')
@@ -284,6 +254,10 @@ export function MobileWebShellScreen({
     // Pushed, never replaced: the page stays mounted underneath, so Back reveals it with no
     // download and no second `init`.
     onNavigate: (href: string) => {
+      // An overlay hands its place to where the page went: Back there returns to the screen beneath.
+      if (overlay) {
+        return void router.replace(href)
+      }
       // Wide, this host's route is the area-owning session below: back to it, or in place of this
       // one from a cold deep link, never a second on top. `dismissTo` takes the href's params.
       if (isWideLayout && isHostRouteOf(href, hostId)) {
@@ -315,7 +289,7 @@ export function MobileWebShellScreen({
     onBinaryFramesDropped: reportDroppedBinaryFrames
   })
 
-  // A route that moved under a screen that stayed mounted: the session switch keeps `paneKey` out
+  // A route that moved under a screen that stayed mounted: the session route keeps `paneKey` out
   // of its key so a notification tap for another pane is a tab switch rather than a page reload,
   // and this is how the page hears about it. Nothing is tracked here — which route the page has,
   // and which one is still owed it, belong to the host, which outlives any one run of this effect.
@@ -340,6 +314,7 @@ export function MobileWebShellScreen({
     sendBack: bridge.sendBack,
     setOptions: navigation.setOptions
   })
+  useReportedShellOverlayLoad(onOverlayLoad, state, pageFrame)
 
   // A profile read that rejected never becomes a host, so the session would otherwise sit in
   // `ready` behind an un-hidden view with nothing serving it and the page asking forever.
@@ -352,9 +327,19 @@ export function MobileWebShellScreen({
       reportShellFailure('document-load-failed')
     }
   }, [reportShellFailure, unreadable])
+  // Log-only and separate, so the failure effect above keeps its own dependencies.
+  useEffect(() => {
+    if (unreadable) {
+      recordShellLifecycleLine(hostId, hostProfileUnreadableLine())
+    }
+  }, [hostId, unreadable])
 
-  if (state.kind === 'native-route') {
-    return fallback
+  // The overlay's caller draws the wait and the exits.
+  if (overlay && state.kind !== 'ready') {
+    return null
+  }
+  if (state.kind === 'route-unavailable') {
+    return <PageRouteUnavailableScreen hostId={hostId} />
   }
   if (state.kind === 'wall') {
     return <ProtocolBlockScreen verdict={state.verdict} />
@@ -366,13 +351,17 @@ export function MobileWebShellScreen({
     return (
       <Centered>
         <Text style={styles.waitingLabel} testID="mobile-web-shell-offline">
-          Connect to this host to download the workspace
+          Connect to this host to download the latest app
         </Text>
       </Centered>
     )
   }
   if (state.kind === 'fetching') {
-    return <Fetching state={state} />
+    return (
+      <Centered>
+        <ShellDownloadProgress state={state} host={snapshot?.host ?? null} />
+      </Centered>
+    )
   }
   if (state.kind !== 'ready') {
     return <Waiting label={state.kind === 'activating' ? SHELL_OPENING_LABEL : 'Checking host'} />
@@ -383,7 +372,9 @@ export function MobileWebShellScreen({
         styles.shellRoot,
         // Edge-to-edge like a native screen: the page pads for the bars itself from the insets
         // `init` carries. The banner takes the status bar strip when it shows.
-        { paddingTop: noticeShown ? insets.top : 0 }
+        { paddingTop: noticeShown ? insets.top : 0 },
+        // An overlay's page draws over the screen beneath, which shows through.
+        overlay && { backgroundColor: 'transparent' }
       ]}
       testID="mobile-web-shell-ready"
     >
@@ -399,7 +390,8 @@ export function MobileWebShellScreen({
       <OrcaMobileWebShellView
         key={state.sessionId}
         ref={bridge.viewRef}
-        style={styles.shellView}
+        // An overlay has no cover over the screen beneath: a fresh WebView draws opaque until the page paints.
+        style={[styles.shellView, overlay && pageFrame !== 'painted' && styles.unpaintedOverlay]}
         generationDirectory={state.generationDirectory}
         sessionId={state.sessionId}
         bridgeEnabled={bridge.bridgeEnabled}
@@ -434,8 +426,10 @@ export function MobileWebShellScreen({
           }
         }}
       />
-      <ShellPageCover label={SHELL_OPENING_LABEL} visible={pageFrame === 'unpainted'} />
-      <DevFacts state={state} droppedBinaryFrames={droppedBinaryFrames} />
+      {overlay ? null : (
+        <ShellPageCover label={SHELL_OPENING_LABEL} visible={pageFrame === 'unpainted'} />
+      )}
+      <ShellDevFacts state={state} droppedBinaryFrames={droppedBinaryFrames} />
     </View>
   )
 }
@@ -447,6 +441,9 @@ const styles = StyleSheet.create({
   },
   shellView: {
     flex: 1
+  },
+  unpaintedOverlay: {
+    opacity: 0
   },
   centered: {
     flex: 1,
@@ -460,11 +457,6 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     marginTop: spacing.md,
     textAlign: 'center'
-  },
-  progress: {
-    fontSize: typography.metaSize,
-    color: colors.textMuted,
-    marginTop: spacing.sm
   },
   failedMessage: {
     fontSize: typography.bodySize,
@@ -485,18 +477,5 @@ const styles = StyleSheet.create({
   },
   pressed: {
     opacity: 0.7
-  },
-  devFacts: {
-    position: 'absolute',
-    left: spacing.sm,
-    bottom: spacing.sm,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 2,
-    borderRadius: radii.button,
-    backgroundColor: colors.bgPanel
-  },
-  devFactsText: {
-    fontSize: typography.metaSize,
-    color: colors.textMuted
   }
 })

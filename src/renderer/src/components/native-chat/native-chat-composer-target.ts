@@ -1,11 +1,12 @@
 import { translate } from '@/i18n/i18n'
-import { NATIVE_CHAT_TURN_STATUS_COPY } from '../../../../shared/native-chat-turn-status'
-import { isRemoteRuntimePtyId } from '@/runtime/runtime-terminal-inspection'
-import type { getSettingsForAgentTabRuntimeOwner } from '@/lib/agent-paste-draft'
+import {
+  NATIVE_CHAT_COMPOSER_PLACEHOLDER,
+  NATIVE_CHAT_TURN_STATUS_COPY
+} from '../../../../shared/native-chat-turn-status'
+import { isRemoteRuntimePtyId } from '../../../../shared/remote-runtime-pty-id'
 
 export type NativeChatResolvedTarget = {
   ptyId: string
-  settings: ReturnType<typeof getSettingsForAgentTabRuntimeOwner>
 }
 
 /** Upper bound for clipboard text pulled into the composer via Cmd/Ctrl+V, so a
@@ -42,10 +43,7 @@ export function nativeChatComposerPlaceholder(
       NATIVE_CHAT_TURN_STATUS_COPY.sendAfterStop
     )
   }
-  return translate(
-    'components.native-chat.composer.placeholder',
-    'Ask anything, @ to mention files, / for commands'
-  )
+  return translate('components.native-chat.composer.placeholder', NATIVE_CHAT_COMPOSER_PLACEHOLDER)
 }
 
 export function nativeChatComposerTargetIsRemote(ptyId: string | null): boolean {

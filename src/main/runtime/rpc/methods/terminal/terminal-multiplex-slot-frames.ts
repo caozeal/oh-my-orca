@@ -5,8 +5,7 @@ import {
 } from '../../../../../shared/terminal-stream-protocol'
 import {
   TerminalMultiplexLegacyAckFrame,
-  TerminalMultiplexSnapshotRequestFrame,
-  TerminalMultiplexSourceRangeAckFrame
+  TerminalMultiplexSnapshotRequestFrame
 } from './stream-schemas'
 import { getTerminalInputSequenceLedger } from './terminal-input-sequence-ledger'
 import { handleMultiplexInputFrame } from './terminal-multiplex-input-frame'
@@ -19,6 +18,7 @@ import {
   serializeBudgetedRequestedSnapshot
 } from './terminal-snapshot-publication'
 import { updateViewportForClient } from './terminal-viewport-update'
+import { notePausedOutputDropped } from './terminal-multiplex-paused-output-drop'
 import {
   isMultiplexStreamAttached,
   type MultiplexSnapshotRequest,
@@ -64,20 +64,9 @@ export function installMultiplexSlotFrames(state: TerminalMultiplexConnection): 
     }
     if (frame.opcode === TerminalStreamOpcode.Ack) {
       const payload = decodeTerminalStreamJson<unknown>(frame.payload) ?? {}
-      if (stream.ackOutputSourceRanges) {
-        const parsed = TerminalMultiplexSourceRangeAckFrame.safeParse(payload)
-        if (parsed.success) {
-          state.acknowledgeSourceRanges(
-            stream,
-            parsed.data.streamGeneration,
-            parsed.data.ackedEndByte
-          )
-        }
-      } else {
-        const parsed = TerminalMultiplexLegacyAckFrame.safeParse(payload)
-        if (parsed.success) {
-          state.acknowledgeOutput(stream, parsed.data.bytes)
-        }
+      const parsed = TerminalMultiplexLegacyAckFrame.safeParse(payload)
+      if (parsed.success) {
+        state.acknowledgeOutput(stream, parsed.data.bytes)
       }
       return
     }
@@ -92,10 +81,17 @@ export function installMultiplexSlotFrames(state: TerminalMultiplexConnection): 
       }
       stream.outputPaused = payload.paused
       if (stream.outputPaused) {
+        stream.pausedOutputDropNoticeSent = false
+        const discardsQueuedOutput =
+          stream.ackPendingOutput.length > 0 || stream.ackPendingOutputOverflowed
+        // Why: batched bytes flush into the paused gate, which reports them as dropped.
         stream.outputBatcher.flush()
         stream.ackPendingOutput = []
         stream.ackPendingOutputBytes = 0
         stream.ackPendingOutputOverflowed = false
+        if (discardsQueuedOutput) {
+          notePausedOutputDropped(state, stream)
+        }
       }
       return
     }

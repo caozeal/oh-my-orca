@@ -6,6 +6,7 @@ import { grokBackgroundTaskNotification, grokToolBackgroundTasks } from './grok-
 import { grokModelEfforts } from './grok-model-catalog'
 import { grokSubagentNotification, grokToolSubagents } from './grok-subagents'
 import { grokSubagentStop } from './grok-subagent-stop'
+import { grokBackgroundTaskStop } from './grok-background-task-stop'
 
 const tokenCount = z.number().int().nonnegative()
 const toolMetaSchema = z.object({ 'x.ai/tool': z.object({ name: z.string().min(1) }) })
@@ -194,6 +195,7 @@ function notification(
 
 export const GROK_ACP_DIALECT: AcpDialect = {
   subagentStop: grokSubagentStop,
+  backgroundTaskStop: grokBackgroundTaskStop,
   injectedPromptIdentity: true,
   toolName: (update) => {
     const parsed = toolMetaSchema.safeParse(update._meta)
@@ -208,8 +210,5 @@ export const GROK_ACP_DIALECT: AcpDialect = {
   contextWindow,
   modelEfforts: grokModelEfforts,
   promptErrorDetail: (error) => promptErrorDataSchema.safeParse(error.data).data?.message,
-  failedTurnText: (stopReason) =>
-    stopReason === 'rate_limit'
-      ? 'Grok usage limit reached.'
-      : 'Grok ended this turn with an error.'
+  failedTurnText: () => 'Grok ended this turn with an error.'
 }

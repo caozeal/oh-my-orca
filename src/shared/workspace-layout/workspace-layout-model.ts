@@ -10,9 +10,10 @@ import type { PersistedClientHostedBrowserPage } from '../client-hosted-browser-
 import type { ClosedTerminalTabTombstone } from '../closed-terminal-tab-tombstones'
 import type { ExecutionHostId } from '../execution-host'
 import type { TabContentType, TabGroupLayoutNode } from '../tab-types'
-import type { TerminalPaneLayoutNode, TerminalTab } from '../terminal-tab-types'
+import type { TerminalGrid, TerminalPaneLayoutNode, TerminalTab } from '../terminal-tab-types'
 import type { PersistedOpenFile } from '../workspace-session-state-types'
 import type { BrowserWorkspace } from '../browser-workspace-types'
+import type { LayoutEditorView } from './layout-editor-view'
 
 export type LayoutTerminalPanes = {
   root: TerminalPaneLayoutNode | null
@@ -38,12 +39,7 @@ type LayoutTabFields = {
 /** Creation fields only a terminal tab carries. */
 export type LayoutTerminalCreation = Pick<
   TerminalTab,
-  | 'defaultTitle'
-  | 'shellOverride'
-  | 'forceHostRuntime'
-  | 'startupCwd'
-  | 'launchAgent'
-  | 'agentLaunchPane'
+  'defaultTitle' | 'shellOverride' | 'forceHostRuntime' | 'startupCwd' | 'launchAgent'
 >
 
 export type LayoutTerminalTab = LayoutTabFields & {
@@ -83,10 +79,17 @@ export type LayoutClosedTab = Omit<ClosedTerminalTabTombstone, 'worktreeId'>
 export type LayoutLeaf = {
   /** The terminal it shows; absent while unbound. */
   ptyId?: string
+  /** Rises on each pty bind, retire and rollback of this pane in this process. In memory only. */
+  ptyGeneration?: number
   incarnationId?: string
   /** User pane title. */
   title?: string
+  /** The pane's last grid: the size its terminal starts at. */
+  lastGrid?: TerminalGrid
+  /** A slept pane's record (isPaneSleepRecord). Never set with `resume`. */
   sleeping?: LayoutSleepingRecord
+  /** A running agent's resume record (origin live/quit), not a sleep. Never set with `sleeping`. */
+  resume?: LayoutSleepingRecord
 }
 
 export type WorkspaceLayout = {
@@ -98,6 +101,8 @@ export type WorkspaceLayout = {
   groups: LayoutGroup[]
   groupLayout?: TabGroupLayoutNode
   editorFiles?: LayoutEditorFile[]
+  /** Tab id → what an editor tab shows beyond its file (diff, conflict, preview…). The view is not saved. */
+  editorViews?: Record<string, LayoutEditorView>
   browserTabs?: LayoutBrowserTab[]
   /** Leaf id → the data of a pane of one of this workspace's terminal tabs. */
   leaves?: Record<string, LayoutLeaf>

@@ -9,19 +9,12 @@ import type { LoadedWorkspaceLayout } from './workspace-layout-load-types'
 import type { WorkspaceLayout, WorkspaceLayoutModel } from './workspace-layout-model'
 import { checkPaneOwners, paneOwnerGroups } from './workspace-layout-rules'
 import type { PaneOwner, WorkspaceLayoutViolation } from './workspace-layout-rule-types'
+import { emptyLayoutViewRecord } from './workspace-layout-views'
 
 /** Nothing beside the layout: no view selection, facts or pass-through fields. */
 export function emptyLayoutBeside(): Omit<LoadedWorkspaceLayout, 'layout'> {
   return {
-    desktopView: {
-      activeRepoId: null,
-      activeWorktreeId: null,
-      activeTabId: null,
-      groups: {},
-      lastFocusedAt: {},
-      panes: {},
-      editorDrafts: {}
-    },
+    desktopView: emptyLayoutViewRecord(),
     facts: { tabLabels: {}, terminalRows: {}, scrollback: {}, browserTabs: {} },
     carried: {
       unownedTerminalLayouts: {},
@@ -108,6 +101,13 @@ function checkWorkspace(
   const strays = Object.keys(workspace.leaves ?? {}).filter((leafId) => !paneIds.has(leafId))
   if (strays.length > 0) {
     breach('leaf_without_pane', strays, `pane data for panes no tab holds`)
+  }
+  // One disk entry holds a pane's record, so a leaf with both would lose one on save.
+  const doubled = Object.entries(workspace.leaves ?? {}).flatMap(([leafId, leaf]) =>
+    leaf.sleeping && leaf.resume ? [leafId] : []
+  )
+  if (doubled.length > 0) {
+    breach('leaf_sleeping_and_resume', doubled, `panes with both a sleep and a resume record`)
   }
   return violations
 }

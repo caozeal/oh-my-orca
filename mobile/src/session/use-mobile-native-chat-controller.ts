@@ -22,8 +22,6 @@ import { mobileNativeChatScopeKey } from './mobile-native-chat-scope-key'
 
 export type { MobileNativeChatController } from './mobile-native-chat-controller-contract'
 
-const NATIVE_CHAT_STREAM_THROTTLE_MS = 50
-
 /** Owns mobile native-chat state and teardown outside the already dense session
  *  route. The route remains responsible only for choosing and rendering the view. */
 export function useMobileNativeChatController(args: {
@@ -54,7 +52,6 @@ export function useMobileNativeChatController(args: {
     activeSessionTabId,
     activeHandleRef,
     deviceTokenRef,
-    nativeChatTranscriptIsLocalReadable,
     nativeChatInputLeaseReady,
     connState,
     agentSessionHostSupport = null,
@@ -69,6 +66,8 @@ export function useMobileNativeChatController(args: {
     activeChatStructured,
     activeTabAgentWorking,
     isTabChatView,
+    sessionViewReady,
+    setTabView,
     nativeChatStatus,
     showNativeChat,
     showNativeChatRef,
@@ -76,14 +75,7 @@ export function useMobileNativeChatController(args: {
     streamIdentity,
     streamScopeKey,
     toggleTabChatView
-  } = useMobileNativeChatActiveResolution({
-    hostId,
-    worktreeId,
-    activeSessionTab,
-    activeSessionTabId,
-    activeHandleRef,
-    nativeChatTranscriptIsLocalReadable
-  })
+  } = useMobileNativeChatActiveResolution(args)
 
   // The lane runs before the drafts hook (fixed hook order); Edit's composer
   // append reaches the drafts state through this ref, set below once they exist.
@@ -132,8 +124,7 @@ export function useMobileNativeChatController(args: {
     // terminal view would permanently decline the prefill.
     chatActive: showNativeChat,
     transcriptLoading: nativeChatSession.transcriptLoading,
-    transcriptSettled: nativeChatSession.status === 'ready',
-    queuedCards: structuredNativeChat.queued.cards
+    transcriptSettled: nativeChatSession.status === 'ready'
   })
 
   // Deliberately not gated on the chat view being visible: the streaming gate
@@ -149,15 +140,17 @@ export function useMobileNativeChatController(args: {
     activeChatStructured
       ? undefined
       : mobileNativeChatStreamPreview(nativeChatStatus, nativeChatAgentWorking),
-    NATIVE_CHAT_STREAM_THROTTLE_MS
+    50
   )
   const {
     permission: legacyNativeChatPermission,
     question: legacyQuestion,
     detectedAsk: nativeChatDetectedAsk,
-    ask: nativeChatAskPrompt
+    ask: nativeChatAskPrompt,
+    structuredAnswer
   } = useMobileNativeChatPrompts({
-    enabled: activeChatResolution != null && !activeChatStructured,
+    enabled: activeChatStructured || activeChatResolution != null,
+    structured: activeChatStructured ? structuredNativeChat : null,
     status: nativeChatStatus,
     messages: nativeChatSession.messages,
     transcriptLoading: nativeChatSession.transcriptLoading
@@ -182,7 +175,7 @@ export function useMobileNativeChatController(args: {
     : nativeChatInputLeaseReady && connState === 'connected'
 
   const {
-    answerAsk: handleNativeChatAnswerAsk,
+    answerAsk: bridgeAnswerAsk,
     cancelAsk: handleNativeChatCancelAsk,
     respondPermission: legacyHandleNativeChatRespondPermission,
     stop: handleNativeChatStop
@@ -226,12 +219,10 @@ export function useMobileNativeChatController(args: {
   })
 
   const structuredNativeChatSend = useMobileStructuredNativeChatSendBridge({
-    agent: activeChatResolution?.agent === 'claude' ? 'claude' : 'codex',
+    agent: activeChatResolution?.agent,
     sendStructured: structuredNativeChat.sendWithOutcome,
     captureSendOrigin,
     clearDraftForSend,
-    acceptSend,
-    holdUnconfirmedSend,
     restoreRejectedDraft,
     onSendError
   })
@@ -250,6 +241,7 @@ export function useMobileNativeChatController(args: {
       modelSwitchCommand: activeSessionTab?.agentStatus?.modelSwitchCommand,
       structured: {
         optionPickerRequest: structuredNativeChat.optionPickerRequest,
+        optionSurface: structuredNativeChat.optionSurface,
         conversationCommands: structuredNativeChat.conversationCommands,
         snapshot: structuredNativeChat.optionSnapshot,
         pendingId: structuredNativeChat.pendingOptionId,
@@ -264,7 +256,7 @@ export function useMobileNativeChatController(args: {
     appendComposerTextRef.current = appendComposerText
   }, [appendComposerText, recordNativeChatSessionOptionCommand])
   // Card actions retire the route's held failure banner too, not just sends.
-  const answerAsk = useNativeChatAcceptedAction(handleNativeChatAnswerAsk, onSendResolved)
+  const answerAsk = useNativeChatAcceptedAction(structuredAnswer ?? bridgeAnswerAsk, onSendResolved)
   const cancelAsk = useNativeChatAcceptedAction(handleNativeChatCancelAsk, onSendResolved)
   const promptCards = useMobileNativeChatPromptCards({
     terminal: {
@@ -282,7 +274,9 @@ export function useMobileNativeChatController(args: {
   })
 
   return {
+    sessionViewReady,
     isTabChatView,
+    setTabView,
     toggleTabChatView,
     showNativeChat,
     showNativeChatRef,
@@ -291,29 +285,36 @@ export function useMobileNativeChatController(args: {
     setChatComposerText,
     getChatComposerEditGeneration,
     chatPending,
-    chatImagePreviewsByMessageId,
+    chatImagePreviewsByMessageId: activeChatStructured
+      ? structuredNativeChat.imagePreviewsByMessageId
+      : chatImagePreviewsByMessageId,
     nativeChatSession,
     /** Structured lane: drives the per-turn status row and live tool progress. */
     nativeChatStructured: activeChatStructured,
     nativeChatVisualSource: activeChatStructured ? structuredNativeChat.visualSource : null,
+    nativeChatItemSource:
+      activeChatStructured && agentSessionHostSupport?.itemDetail === true
+        ? structuredNativeChat.visualSource
+        : null,
     nativeChatAgentWorking,
     nativeChatTurnIndicator: activeChatStructured ? structuredNativeChat.turnIndicator : null,
     nativeChatWorkingStartedAt: activeChatStructured ? structuredNativeChat.workingStartedAt : null,
     nativeChatSettledTurns: activeChatStructured ? structuredNativeChat.settledTurns : null,
     nativeChatTurnJournal: activeChatStructured ? structuredNativeChat.turnJournal : null,
+    nativeChatReceipts: activeChatStructured ? structuredNativeChat.receipts : null,
+    nativeChatActionablePromptIds: structuredNativeChat.actionablePromptIds,
     // Only the structured lane names a refusal's cause; the bridge lane's starved ones drop none.
     nativeChatCommandRefusalCauses: structuredNativeChat.commandRefusalCauses,
+    // A host that stops what the chat has in flight takes Stop before the agent opens a turn.
     nativeChatCanStop: activeChatStructured
-      ? structuredNativeChat.turnId !== null
+      ? structuredNativeChat.turnId !== null ||
+        (agentSessionHostSupport?.conversationStop === true && structuredNativeChat.isWorking)
       : nativeChatAgentWorking,
     nativeChatStreamingText,
     nativeChatStreamLive,
     nativeChatStreamScopeKey: streamScopeKey,
     ...promptCards,
-    nativeChatAsk:
-      !activeChatStructured && (askDismissal.showAsk || askDismissal.collapsedAsk)
-        ? nativeChatAskPrompt
-        : null,
+    nativeChatAsk: askDismissal.showAsk || askDismissal.collapsedAsk ? nativeChatAskPrompt : null,
     nativeChatAskKey: askDismissal.askKey,
     dismissNativeChatAsk: askDismissal.dismissAsk,
     collapseNativeChatAsk: askDismissal.collapseAsk,
@@ -332,6 +333,8 @@ export function useMobileNativeChatController(args: {
       ? structuredNativeChatSend.sendWithOutcome
       : handleNativeChatSendWithOutcome,
     readSeededLaunchDraft,
-    nativeChatSessionOptions
+    nativeChatSessionOptions,
+    // A terminal-backed chat pastes images into the agent's own input instead.
+    nativeChatAcceptsImages: !activeChatStructured || structuredNativeChat.acceptsImages
   }
 }

@@ -14,7 +14,9 @@ afterEach(async () => {
 describe('a live Grok listing', () => {
   it('is saved through the host catalog when the chat reads its options', async () => {
     const modelCatalog: AgentModelCatalogService = {
+      peek: () => null,
       read: vi.fn(async () => ({ origin: 'unknown' as const })),
+      retainedLiveModelIds: vi.fn(async () => []),
       recordLiveListing: vi.fn(),
       prewarm: vi.fn(async () => {}),
       stop: vi.fn(),
@@ -22,13 +24,44 @@ describe('a live Grok listing', () => {
     }
     const { host } = await openAttachedHostRig({}, undefined, modelCatalog)
 
+    // Its start was saved once as the chat attached; this read is saved too.
+    expect(modelCatalog.recordLiveListing).toHaveBeenCalledTimes(1)
     await host.readOptions(SESSION)
 
-    expect(modelCatalog.recordLiveListing).toHaveBeenCalledTimes(1)
-    const [sessionId, listing] = vi.mocked(modelCatalog.recordLiveListing).mock.calls[0]!
+    expect(modelCatalog.recordLiveListing).toHaveBeenCalledTimes(2)
+    const [sessionId, listing] = vi.mocked(modelCatalog.recordLiveListing).mock.calls[1]!
     expect(sessionId).toBe(SESSION)
     expect(listing.models.map((model) => model.id)).toEqual(['grok-4.7', 'grok-4.6'])
-    // The session's picks are no one's default.
+    // The session's picks are no one's default, and only its start says what its config resolved.
     expect(listing.models.every((model) => !model.isDefault)).toBe(true)
+    expect(listing).not.toHaveProperty('configuredDefault')
+  })
+
+  it('starts the chat even when saving its start listing throws', async () => {
+    const modelCatalog: AgentModelCatalogService = {
+      peek: () => null,
+      read: vi.fn(async () => ({ origin: 'unknown' as const })),
+      retainedLiveModelIds: vi.fn(async () => []),
+      recordLiveListing: vi.fn().mockImplementationOnce(() => {
+        throw new Error('catalog unavailable')
+      }),
+      prewarm: vi.fn(async () => {}),
+      stop: vi.fn(),
+      providerStarted: vi.fn()
+    }
+    // The rig waits for the child to turn ready: bookkeeping never fails a proven start.
+    const { host, rig, store, fence } = await openAttachedHostRig({}, undefined, modelCatalog)
+    expect(modelCatalog.recordLiveListing).toHaveBeenCalledTimes(1)
+    expect(store.getRecord(SESSION)?.lease.ownerProcess).not.toBeNull()
+    // The rest of the start still lands, and live options remain readable.
+    await expect(host.readOptions(SESSION)).resolves.toMatchObject({ current: expect.any(Object) })
+    expect(modelCatalog.recordLiveListing).toHaveBeenCalledTimes(2)
+    expect(
+      (await rig.adapter.readOptions({ sessionId: SESSION, fence: fence() })).current
+    ).toMatchObject({
+      model: 'grok-4.7',
+      effort: 'high'
+    })
+    expect(store.getRecord(SESSION)?.options).toBeUndefined()
   })
 })

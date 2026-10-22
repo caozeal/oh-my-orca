@@ -9,17 +9,22 @@ import {
   RELAY_CLOSE_CODE,
   RELAY_DEFAULT_REGION,
   RELAY_PROTOCOL_LIMITS,
-  RelayAuthSchema
+  RelayAuthSchema,
+  cellPlacementCeiling
 } from '@orca-cloud/relay-contract'
 import type { IncomingMessage } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
-import { createRemoteJWKSet } from 'jose'
 import { WebSocketServer } from 'ws'
 import type WebSocket from 'ws'
 import type { RawData } from 'ws'
+import { CellAdmitEffectiveWriter } from './cell-admit-effective-writer.js'
+import { ReserveDeadMan, reserveDeadManWindowMs } from './cell-reserve-dead-man.js'
 import { createRelayApp } from './app.js'
-import type { CellFlags } from './cell-flags.js'
+import { classifyAssignmentLease } from './assignment-lease.js'
+import { defaultIntakePerSec, type CellFlags } from './cell-flags.js'
+import { CellReserveBook } from './cell-reserve-book.js'
+import type { DemoteRequest, ReserveRequest } from './cell-reserve-contract.js'
 import { AssignmentLeaseShadow } from './assignment-lease-shadow.js'
 import { RelayAssignmentStore } from './assignment-store.js'
 import type { RelayConfig } from './config.js'
@@ -39,9 +44,19 @@ import type { AppliedControlFlags } from './relay-control-flag-channel.js'
 import { createRelayLocalReadiness } from './relay-local-readiness.js'
 import { createRelayReadiness } from './relay-readiness.js'
 import { createRelayTokenVerifier, readBearer } from './relay-token-verifier.js'
+import { createStaleIfErrorJWKSet } from './stale-if-error-jwks.js'
 import { closeRelayWebSocket } from './relay-websocket-close.js'
 import { ShadowDirectoryCompare } from './shadow-directory-compare.js'
-import { startShadowSeatPoller } from './shadow-seat-directory.js'
+import { type ShadowSeatPoller, startShadowSeatPoller } from './shadow-seat-directory.js'
+import { CellReserveClient } from './cell-reserve-client.js'
+import { googleMetadataIdentityToken, reusedIdentityToken } from './google-metadata-identity-token.js'
+import { ReserveAssignment } from './reserve-assignment.js'
+import { ReservePlacer } from './reserve-placement.js'
+import {
+  reconcileReserveLedger,
+  RESERVE_LEDGER_RECONCILE_MS,
+  ReserveLedgerWriter
+} from './reserve-ledger-writer.js'
 import { ProcessQueuedByteBudget } from './splice-forwarder.js'
 
 // A malformed percent-escape in the request target must be a client error, never a URIError
@@ -60,6 +75,10 @@ function decodePathSegment(value: string): string | null {
 // tripping it. On 10-07 every window that met both also logged SQL failures.
 export const HOST_HELLO_SHED_OLDEST_WAIT_MS = 1_000
 const HOST_HELLO_SHED_RETRY_AFTER_SECONDS = 2
+// Well inside the flag channel's 5 s read, so a flip back starts re-registering within ~6 s.
+export const RESERVE_MODE_WATCH_MS = 1_000
+// Shipped desktops ignore it; it is for the ones that learn to read it.
+const CELL_FULL_RETRY_AFTER_SECONDS = 2
 
 function rejectUpgrade(
   socket: NodeJS.WritableStream,
@@ -139,9 +158,11 @@ export function createRelayServer(
     perMessageDeflate: false,
     maxPayload: 1024 * 1024
   })
-  const relayJwks = createRemoteJWKSet(new URL(config.jwksUrl))
+  const relayJwks = createStaleIfErrorJWKSet(new URL(config.jwksUrl))
   const verifyRelayToken = createRelayTokenVerifier(config, relayJwks)
   const store = new RelayCredentialStore(observedDatabase, options.now)
+  // Bound once the poller below exists; without one, no poll ever reads as dead.
+  const pollEvidence: { deadCellVerdict?: ShadowSeatPoller['deadCellVerdict'] } = {}
   const assignments = new RelayAssignmentStore(observedDatabase, options.now, {
     requireLiveCells: config.role === 'director',
     placementLoadBand: config.role === 'director' ? new PlacementLoadBand(options.random) : undefined,
@@ -150,7 +171,8 @@ export function createRelayServer(
     regionalRehomeDirectorRegion:
       config.role === 'director' ? (config.region ?? RELAY_DEFAULT_REGION) : undefined,
     recordControlRenewal: (durationMs, outcome) =>
-      observability.recordControlRenewal?.(durationMs, outcome)
+      observability.recordControlRenewal?.(durationMs, outcome),
+    deadCellVerdict: (cellId, now) => pollEvidence.deadCellVerdict?.(cellId, now) ?? null
   })
   const readiness = createRelayReadiness(observedDatabase, config.jwksUrl, {
     jwksGraceMs: config.readinessJwksGraceMs,
@@ -159,12 +181,176 @@ export function createRelayServer(
     observeGrace: (event) => observability.recordReadinessGrace(event)
   })
   const ready = readiness.check
+  // Set once placement is built: a director configured `on` that could not build it (no map or
+  // no rehome credential) books nothing, so it must not keep a reserve cell's dead-man fed.
+  const placing = { on: false }
   const shadowSeatPoller = startShadowSeatPoller(config, {
-    listCells: () => assignments.seatFeedCells()
+    listCells: () => assignments.seatFeedCells(),
+    reserver: () => placing.on
   })
+  pollEvidence.deadCellVerdict = shadowSeatPoller?.deadCellVerdict
   const shadowCompare = shadowSeatPoller
     ? new ShadowDirectoryCompare(shadowSeatPoller.directory, options.now)
     : undefined
+  // Step 5 on directors: needs the map and the rehome credential the cells verify.
+  const directorId = randomUUID()
+  const rehomeAudience = config.rehomeAudience
+  // Only a director that books writes rows, and only for the joins it booked.
+  const reserveLedger =
+    config.role === 'director' && shadowSeatPoller && config.reservePlacement === 'on'
+      ? new ReserveLedgerWriter(observedDatabase, { now: options.now })
+      : undefined
+  const reservePlacement =
+    config.role === 'director' &&
+    shadowSeatPoller &&
+    rehomeAudience &&
+    (config.reservePlacement ?? 'off') !== 'off'
+      ? new ReserveAssignment({
+          mode: config.reservePlacement ?? 'off',
+          directory: shadowSeatPoller.directory,
+          cells: shadowSeatPoller.cells,
+          startedAt: shadowSeatPoller.startedAt,
+          placer: new ReservePlacer(options.now, options.random),
+          client: new CellReserveClient({
+            directorId,
+            identityToken: reusedIdentityToken(
+              () => googleMetadataIdentityToken(rehomeAudience),
+              options.now
+            )
+          }),
+          readRow: async (identity) => await assignments.hostWhereabouts(identity),
+          databaseBusy: () => readRelayDatabasePoolPressure(database).databasePoolWaiting > 0,
+          now: options.now,
+          random: options.random
+        })
+      : undefined
+  placing.on = reservePlacement?.placementMode === 'on'
+  // A director that is not placing while a cell is in reserve mode strands that cell's hosts on
+  // its memory: its dead-man flips it back, and this says so loudly until then.
+  const offWithReserveTimer =
+    config.role === 'director' && shadowSeatPoller && !placing.on
+      ? setInterval(() => {
+          const { directory } = shadowSeatPoller
+          const cells = directory.cellIds().filter((cellId) => directory.admitModeOf(cellId) === 'reserve')
+          if (cells.length === 0) return
+          console.error(
+            JSON.stringify({
+              event: 'orca_relay_reserve_placement_off_with_reserve_cells',
+              cells,
+              placement: reservePlacement?.placementMode ?? 'off',
+              configured: config.reservePlacement ?? 'off'
+            })
+          )
+        }, 60_000)
+      : null
+  offWithReserveTimer?.unref()
+  if (reserveLedger && shadowSeatPoller) {
+    const directory = shadowSeatPoller.directory
+    directory.onBookedJoin = (join) => {
+      if (join.reservedBy !== directorId) return
+      reserveLedger.enqueue({
+        userId: join.userId,
+        relayHostId: join.relayHostId,
+        cellId: join.cellId,
+        epoch: join.epoch
+      })
+    }
+    directory.onOutranked = (seat) => reservePlacement?.supersedeOutranked(seat)
+    reserveLedger.start()
+    const reconcile = (): void => {
+      const now = (options.now ?? Date.now)()
+      void reconcileReserveLedger({
+        writer: reserveLedger,
+        seats: () =>
+          directory
+            .cellIds()
+            .filter((cellId) => directory.admitModeOf(cellId) === 'reserve')
+            .flatMap((cellId) =>
+              directory.seatsOnCell(cellId).map(({ userId, relayHostId, seat }) => ({
+                userId,
+                relayHostId,
+                cellId,
+                epoch: seat.epoch,
+                joinedAt: seat.joinedAt
+              }))
+            ),
+        demote: (seat, row) => {
+          reservePlacement?.demoteSeat(seat)
+          // The re-assign mints above the row, so the mirror can take it.
+          reservePlacement?.raiseEpochFloor(seat, row.epoch)
+          console.warn(
+            JSON.stringify({
+              event: 'orca_relay_reserve_ledger_seat_behind_row',
+              cellId: seat.cellId,
+              epoch: seat.epoch,
+              rowEpoch: row.epoch
+            })
+          )
+        },
+        now
+      })
+        .catch(() => console.warn('[orca-relay] reserve ledger reconcile deferred'))
+        .finally(schedule)
+    }
+    // Jittered, so five directors do not reconcile together.
+    const schedule = (): void => {
+      const random = options.random ?? Math.random
+      setTimeout(reconcile, RESERVE_LEDGER_RECONCILE_MS + random() * 60_000).unref?.()
+    }
+    // A restart loses the queue: the first run goes as soon as the map is complete.
+    const clock = options.now ?? Date.now
+    const bootedAt = clock()
+    const firstRun = setInterval(() => {
+      if (!directory.isComplete() && clock() - bootedAt < RESERVE_LEDGER_RECONCILE_MS) return
+      clearInterval(firstRun)
+      reconcile()
+    }, 1_000)
+    firstRun.unref?.()
+  }
+  const configuredConnectionLimits =
+    config.connectionHardCap === undefined
+      ? null
+      : (options.connectionLedgerLimits ?? {
+          hardCap: config.connectionHardCap,
+          controlReserve: RELAY_ADMISSION_BUDGETS.reservedHostControls
+        })
+  const connectionLedger =
+    configuredConnectionLimits === null
+      ? null
+      : new RelayConnectionLedger(
+          configuredConnectionLimits.hardCap,
+          configuredConnectionLimits.controlReserve
+        )
+  // Step 5: a booking may fill the cell only to the ceiling the directors place against.
+  const placementCeiling =
+    config.connectionHardCap === undefined || config.connectionUnobservedBound === undefined
+      ? null
+      : cellPlacementCeiling(config.connectionHardCap, config.connectionUnobservedBound)
+  const reserveBook =
+    config.role === 'cell' && connectionLedger && placementCeiling !== null
+      ? new CellReserveBook(
+          {
+            tryReserve: () => connectionLedger.tryReserveBooking(placementCeiling),
+            canReserve: () => connectionLedger.canReserveBooking(placementCeiling)
+          },
+          () =>
+            options.cellFlags?.().flags.intakePerSec ?? defaultIntakePerSec(config.region),
+          options.now
+        )
+      : null
+  // The hello shed's test: the pool is already timing queries out.
+  const databaseShedding = (): boolean =>
+    readRelayDatabasePoolPressure(database).databasePoolWaiting >= config.databasePoolMax &&
+    readRelayDatabasePoolOldestWaitMs(database) >= HOST_HELLO_SHED_OLDEST_WAIT_MS
+  const reserveDeadMan = reserveBook
+    ? new ReserveDeadMan(config.cellId, options.now, reserveDeadManWindowMs(config.cellId))
+    : null
+  // The switch file's admitMode, unless the dead-man has flipped this cell back.
+  const effectiveAdmitMode = (): 'db' | 'reserve' => {
+    const applied = options.cellFlags?.()
+    if (!applied) return 'db'
+    return reserveDeadMan ? reserveDeadMan.mode(applied) : applied.flags.admitMode
+  }
   const queuedBytes = new ProcessQueuedByteBudget()
   const sessions = new HostSessionRegistry(
     config,
@@ -180,8 +366,52 @@ export function createRelayServer(
       enabled: () => options.cellFlags?.().flags.ticketCheck === 'shadow',
       key: config.assignmentSigningKey,
       cellId: config.cellId
-    })
+    }),
+    reserveBook
+      ? {
+          mode: effectiveAdmitMode,
+          directorContact: () => reserveDeadMan?.contact(),
+          reregisterInFlight: () => options.cellFlags?.().flags.reregisterInFlight,
+          phonePath: () => options.cellFlags?.().flags.phonePath ?? 'db',
+          ticketEnforce: () => options.cellFlags?.().flags.ticketCheck === 'enforce',
+          dryRunEnabled: () => options.cellFlags?.().flags.reserveDryRun === true,
+          databaseShedding: () => databaseShedding(),
+          book: reserveBook,
+          verifyLease: (input) =>
+            classifyAssignmentLease({
+              ...input,
+              key: config.assignmentSigningKey,
+              cellId: config.cellId
+            })
+        }
+      : undefined
   )
+  // Expired bookings give their units back even while no director is reserving. A flip out of
+  // reserve mode voids the bookings and registers every control admitted from memory.
+  let appliedAdmitMode = effectiveAdmitMode()
+  const admitEffective =
+    config.role === 'cell' && reserveBook
+      ? new CellAdmitEffectiveWriter({
+          write: async (mode) =>
+            await assignments.recordCellAdmitEffective({ cellId: config.cellId, cellIncarnation, mode }),
+          databaseBusy: () => readRelayDatabasePoolPressure(database).databasePoolWaiting > 0,
+          now: options.now ?? Date.now
+        })
+      : undefined
+  const reserveSweepTimer = reserveBook
+    ? setInterval(() => {
+        reserveBook.sweep()
+        const admitMode = effectiveAdmitMode()
+        if (appliedAdmitMode === 'reserve' && admitMode !== 'reserve') {
+          reserveBook.clear()
+          sessions.reregisterMemoryControls()
+        }
+        appliedAdmitMode = admitMode
+        // A booted cell runs db defaults until its first flag read, so it writes nothing until then.
+        admitEffective?.tick(admitMode, options.cellFlags?.().flags.admitMode === 'reserve')
+      }, RESERVE_MODE_WATCH_MS)
+    : null
+  reserveSweepTimer?.unref()
   const app = createRelayApp(config, {
     store,
     assignments,
@@ -204,6 +434,23 @@ export function createRelayServer(
     cellIncarnation,
     cellSeatFeed: (sinceSeq) => sessions.seatFeed(sinceSeq),
     cellFlags: options.cellFlags,
+    ...(reserveBook && placementCeiling !== null
+      ? {
+          cellReserve: (request: ReserveRequest) => sessions.reserve(request),
+          cellReserverPoll: () => reserveDeadMan?.contact(),
+          // Reserve until every control it admitted from memory holds a lease again: the flag
+          // workflow records db in Postgres (and sweeps resume) only after this says db.
+          cellAdmitModeRaw: effectiveAdmitMode,
+          cellAdmitModeEffective: (): 'db' | 'reserve' =>
+            effectiveAdmitMode() === 'reserve' || sessions.reregistrationPending() > 0
+              ? 'reserve'
+              : 'db',
+          cellPhonePathEffective: () => sessions.phonePathEffective(),
+          cellDemote: (request: DemoteRequest) => sessions.demote(request),
+          cellReserveCounts: () => sessions.reserveCounts(),
+          cellPlacementCeiling: placementCeiling
+        }
+      : {}),
     isDraining: () => sessions.isDraining(),
     runtimeCounts: () => runtimeCounts(),
     regionalRehomeSafetySnapshot: () => ({
@@ -225,9 +472,11 @@ export function createRelayServer(
     recordDrainReturnRetryAfter: (seconds) => observability.recordDrainReturnRetryAfter?.(seconds),
     recordAdmissionServiceMs: (lane, durationMs) =>
       observability.recordAdmissionServiceMs?.(lane, durationMs),
+    recordStickySlot: (sample) => observability.recordStickySlot?.(sample),
     recordAssignmentUnavailable: (cause) => observability.recordAssignmentUnavailable?.(cause),
     recordRegionRequest: (region) => observability.recordRegionRequest?.(region),
     shadowSeats: shadowSeatPoller?.directory,
+    reservePlacement,
     compareShadowSeats: shadowCompare
       ? (route, identity, answer) => {
           shadowCompare.compare(route, identity, answer)
@@ -258,20 +507,6 @@ export function createRelayServer(
   })
   let preAuthConnections = 0
   let totalConnections = 0
-  const configuredConnectionLimits =
-    config.connectionHardCap === undefined
-      ? null
-      : (options.connectionLedgerLimits ?? {
-          hardCap: config.connectionHardCap,
-          controlReserve: RELAY_ADMISSION_BUDGETS.reservedHostControls
-        })
-  const connectionLedger =
-    configuredConnectionLimits === null
-      ? null
-      : new RelayConnectionLedger(
-          configuredConnectionLimits.hardCap,
-          configuredConnectionLimits.controlReserve
-        )
   const preAuthBySource = new Map<string, number>()
   const preAuthAttemptsBySource = new Map<string, { windowStartedAt: number; count: number }>()
 
@@ -567,21 +802,28 @@ export function createRelayServer(
         userId: identity.sub,
         relayHostId: identity.relayHostId
       })
+      // Null outside reserve mode, so today's path is untouched there.
+      const reserveAdmission = sessions.reserveAdmissionFor({
+        userId: identity.sub,
+        relayHostId: identity.relayHostId
+      })
       // A hello costs several pooled queries, each failing after a 2 s wait. Shed
       // only while the pool is already timing them out: the refused desktop gets
       // the same connect error and backoff a timed-out hello gives it today, 2 s
       // sooner (shipped desktops ignore Retry-After). A rebind over a live control
       // is a lease rotation, not a reconnect, so it is never refused here.
-      if (
-        !isRebind &&
-        readRelayDatabasePoolPressure(database).databasePoolWaiting >= config.databasePoolMax &&
-        readRelayDatabasePoolOldestWaitMs(database) >= HOST_HELLO_SHED_OLDEST_WAIT_MS
-      ) {
+      if (!isRebind && reserveAdmission === null && databaseShedding()) {
         observability.recordHostHelloShed()
         rejectUpgrade(socket, 503, 'Service Unavailable', HOST_HELLO_SHED_RETRY_AFTER_SECONDS)
         return
       }
-      const controlUpgrade = connectionLedger?.tryReserveControl(isRebind) ?? null
+      // A booked host may rise to the hard cap. Once its upgrade holds a unit, the booking's
+      // goes back, so the host counts once; a refused upgrade leaves the booking whole.
+      const controlUpgrade =
+        connectionLedger?.tryReserveControl(isRebind || reserveAdmission === 'booked') ?? null
+      if (controlUpgrade && reserveAdmission === 'booked') {
+        reserveBook?.handOff(identity.sub, identity.relayHostId)
+      }
       if (
         (connectionLedger && !controlUpgrade) ||
         (!connectionLedger && totalConnections >= RELAY_ADMISSION_BUDGETS.cloudRunConcurrency)
@@ -589,7 +831,8 @@ export function createRelayServer(
         rejectUpgrade(
           socket,
           connectionLedger ? 503 : 429,
-          connectionLedger ? 'Service Unavailable' : 'Too Many Requests'
+          connectionLedger ? 'Service Unavailable' : 'Too Many Requests',
+          connectionLedger && sessions.inReserveMode() ? CELL_FULL_RETRY_AFTER_SECONDS : undefined
         )
         return
       }
@@ -631,7 +874,12 @@ export function createRelayServer(
     controls.close()
     clients.close()
     dataSockets.close()
+    store.resumeAudit.stop()
   })
+  const resumeAuditDropped = (): number => {
+    const drops = store.resumeAudit.drops()
+    return drops.overflow + drops.aged
+  }
   const runtimeCounts = () => {
     const ledgerCounts = connectionLedger?.counts()
     return {
@@ -639,6 +887,7 @@ export function createRelayServer(
       preAuthConnections,
       ...sessions.runtimeCounts(),
       queuedBytes: queuedBytes.current(),
+      ...(config.role === 'cell' ? { resumeAuditDropped: resumeAuditDropped() } : {}),
       ...(ledgerCounts
         ? {
             inFlightConnections: ledgerCounts.inFlightConnections,
@@ -660,6 +909,8 @@ export function createRelayServer(
     connectionSnapshot,
     ready,
     cellIncarnation,
-    shadowSeatPoller
+    shadowSeatPoller,
+    directorId,
+    reservePlacement
   }
 }

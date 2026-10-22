@@ -1,12 +1,15 @@
+import { getSystemLanguageDetection } from '../i18n/system-language'
+import { setMainUiLanguage } from '../i18n/main-i18n'
+import { rebuildAppMenu } from '../menu/register-app-menu'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, dialog, ipcMain, type IpcMainInvokeEvent } from 'electron'
-import { is } from '@electron-toolkit/utils'
 import type { AppIdentity } from '../../shared/app-identity'
 import type { MarkdownDocument } from '../../shared/filesystem-entry-types'
 import type { FloatingTerminalCwdRequest } from '../../shared/ui-chrome-types'
 import { relaunchApp, runBeforeRelaunchCleanup } from '../app-relaunch'
+import { prepareWindowsAdministratorRestart } from '../windows/windows-administrator-restart'
 import { quitProcess } from '../startup/process-quit-request'
 import type { Store } from '../persistence'
 import { getDevInstanceIdentity } from '../startup/dev-instance-identity'
@@ -14,22 +17,35 @@ import { isPwshAvailableAsync } from '../pwsh'
 import { isWslAvailableAsync, listWslDistrosAsync } from '../wsl'
 import { isGitBashAvailable } from '../git-bash'
 import { setUnreadDockBadgeCount } from '../dock/unread-badge'
-import { destroySystemTray } from '../tray/system-tray'
+import { destroySystemTray, rebuildSystemTrayMenu } from '../tray/system-tray'
 import {
   ensureDefaultFloatingWorkspacePath,
   trustFloatingWorkspaceDirectory,
   resolveFloatingTerminalCwd
 } from './floating-workspace-directory'
-import { isMarkdownDocumentName, markdownDocumentFromFilePath } from './markdown-documents'
+import {
+  isMarkdownDocumentName,
+  markdownDocumentFromFilePath
+} from '../../shared/markdown-document-paths'
 import { registerMacSymbolicHotkeysProbeHandler } from './macos-symbolic-hotkeys-probe'
-import { registerRendererShutdownCheckpointHandler } from './renderer-shutdown-checkpoint'
+import {
+  registerRendererShutdownCheckpointHandler,
+  type QuitResumeRecordsFor
+} from './renderer-shutdown-checkpoint'
 import { readMacKeyboardLayoutSnapshot } from './macos-keyboard-layout-snapshot'
 import { registerMacKeyboardLayoutChangeNotifications } from './macos-keyboard-layout-change-notifications'
 import { isProfileStateSaveDelayed } from '../startup/profile-state-save-delay'
 import { readCommandStdout, readKeyboardInputSourceId } from './macos-keyboard-input-source'
+import { getWindowsAdministratorStatus } from '../windows/windows-administrator-status'
+
+import type { ReconnectFactsFor } from '../persistence/window-save-view'
 
 type RegisterAppHandlersOptions = {
+  quitResumeRecordsFor?: QuitResumeRecordsFor
+  reconnectFactsFor?: ReconnectFactsFor
   onBeforeRelaunch?: () => void | Promise<void>
+  /** Only for app:relaunch, whose app.exit(0) is committed and skips will-quit. */
+  onBeforeRelaunchExit?: () => void | Promise<void>
 }
 
 async function pickFloatingMarkdownDocument(
@@ -104,14 +120,36 @@ function resolveDevFeatureWallAssetDir(): string {
 }
 
 export function registerAppHandlers(store: Store, options: RegisterAppHandlersOptions = {}): void {
-  registerRendererShutdownCheckpointHandler(store)
+  registerRendererShutdownCheckpointHandler(
+    store,
+    options.quitResumeRecordsFor,
+    options.reconnectFactsFor
+  )
   registerMacKeyboardLayoutChangeNotifications()
   ipcMain.handle('app:isProfileStateSaveDelayed', isProfileStateSaveDelayed)
+  ipcMain.handle('app:getSystemLanguageDetection', (_event, preferences: unknown) => {
+    const previous = getSystemLanguageDetection()
+    const detection = getSystemLanguageDetection(
+      Array.isArray(preferences) && preferences.every((tag) => typeof tag === 'string')
+        ? preferences
+        : undefined
+    )
+    if (detection !== previous && store.getSettings().uiLanguage === 'system') {
+      void setMainUiLanguage('system')
+        .then(() => {
+          rebuildAppMenu()
+          rebuildSystemTrayMenu()
+        })
+        .catch((error) => console.warn('[app] failed to refresh system language menus:', error))
+    }
+    return detection
+  })
+  ipcMain.handle('app:getWindowsAdministratorStatus', getWindowsAdministratorStatus)
 
   ipcMain.handle('app:getFeatureWallAssetBaseUrl', (): string => getFeatureWallAssetBaseUrl())
 
   ipcMain.handle('app:getIdentity', (): AppIdentity => {
-    const identity = getDevInstanceIdentity(is.dev)
+    const identity = getDevInstanceIdentity(!app.isPackaged)
     return {
       name: identity.name,
       isDev: identity.isDev,
@@ -151,6 +189,7 @@ export function registerAppHandlers(store: Store, options: RegisterAppHandlersOp
   ipcMain.handle('app:relaunch', async () => {
     // Why: brief delay lets the renderer paint "Restarting…" before the window tears down.
     await runBeforeRelaunchCleanup(options.onBeforeRelaunch)
+    await runBeforeRelaunchCleanup(options.onBeforeRelaunchExit)
     setTimeout(() => {
       // Why: app.exit(0) skips before-quit, so destroy the Windows tray manually to avoid a stale icon.
       destroySystemTray()
@@ -164,6 +203,15 @@ export function registerAppHandlers(store: Store, options: RegisterAppHandlersOp
     await runBeforeRelaunchCleanup(options.onBeforeRelaunch)
     setTimeout(() => {
       relaunchApp('admin-restart')
+      quitProcess()
+    }, 150)
+  })
+
+  ipcMain.handle('app:restartAsAdministrator', async () => {
+    const relaunchOptions = prepareWindowsAdministratorRestart()
+    await runBeforeRelaunchCleanup(options.onBeforeRelaunch)
+    setTimeout(() => {
+      relaunchApp('windows-administrator', undefined, relaunchOptions)
       quitProcess()
     }, 150)
   })

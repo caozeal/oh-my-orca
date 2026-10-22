@@ -19,7 +19,7 @@ import type { SourceControlWorktreeContext } from './use-worktree-context'
  */
 export function useSourceControlFileListing({
   activeRemoteActionSequence,
-  activeRepoSettings,
+  activeRepoTarget,
   activeWorktreeId,
   branchEntries,
   branchName,
@@ -44,7 +44,7 @@ export function useSourceControlFileListing({
   worktreePath
 }: {
   activeRemoteActionSequence: number | null
-  activeRepoSettings: SourceControlWorktreeContext['activeRepoSettings']
+  activeRepoTarget: SourceControlWorktreeContext['activeRepoTarget']
   activeWorktreeId: string | null
   branchEntries: SourceControlWorktreeContext['branchEntries']
   branchName: string
@@ -72,7 +72,7 @@ export function useSourceControlFileListing({
     useSourceControlSubmoduleStatus({
       activeWorktreeId,
       worktreePath,
-      activeRepoSettings,
+      activeRepoTarget,
       entries
     })
   const {
@@ -80,7 +80,6 @@ export function useSourceControlFileListing({
     fileFilterState,
     normalizedFilter,
     isGitHistoryVisible,
-    filteredGrouped,
     displaySections,
     unfilteredDisplaySectionsById,
     filteredBranchEntries,
@@ -103,7 +102,7 @@ export function useSourceControlFileListing({
     collapsedSections
   })
   const { gitHistoryState, refreshGitHistory, refreshGitHistoryRef } = useSourceControlGitHistory({
-    activeRepoSettings,
+    activeRepoTarget,
     activeWorktreeId,
     worktreePath,
     compareBaseRef,
@@ -115,7 +114,7 @@ export function useSourceControlFileListing({
   })
 
   // Why: modifier-click keeps the current pane intact by opening the file in a fresh split to the right.
-  const { resolveSplitTargetGroupId, activeOpenRowKeys, handleOpenDiff, openCommittedDiff } =
+  const { resolveSplitTargetGroupId, activeOpenRowKeys, openUncommittedFile, openBranchFile } =
     useSourceControlRowOpening({
       isMac,
       activeWorktreeId,
@@ -131,7 +130,7 @@ export function useSourceControlFileListing({
   const { selectedKeys, handleSelect, handleContextMenu, clearSelection } =
     useSourceControlSelection({
       flatEntries: visibleSelectionEntries,
-      onOpenDiff: handleOpenDiff,
+      onOpenFile: openUncommittedFile,
       shouldOpenAsSplit,
       containerRef: sourceControlRef
     })
@@ -166,7 +165,7 @@ export function useSourceControlFileListing({
   } = useSourceControlBulkActions({
     selectedKeys,
     flatEntriesByKey,
-    activeRepoSettings,
+    activeRepoTarget,
     activeWorktreeId,
     worktreePath,
     grouped,
@@ -205,14 +204,13 @@ export function useSourceControlFileListing({
     expandedSubmoduleKeys,
     fileFilterState,
     filteredBranchEntries,
-    filteredGrouped,
     flatEntriesByKey,
     gitHistoryState,
     grouped,
     handleBulkStage,
     handleBulkUnstage,
     handleContextMenu,
-    handleOpenDiff,
+    openUncommittedFile,
     handleSelect,
     handleStageAllPaths,
     handleStageAllPrimary,
@@ -222,7 +220,7 @@ export function useSourceControlFileListing({
     isExecutingBulk,
     isGitHistoryVisible,
     normalizedFilter,
-    openCommittedDiff,
+    openBranchFile,
     pushRecovery,
     refreshGitHistory,
     refreshGitHistoryRef,

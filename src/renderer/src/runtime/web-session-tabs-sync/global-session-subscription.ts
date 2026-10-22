@@ -4,6 +4,7 @@ import { clearWebSessionFocusIntentsForOwner } from '../web-session-focus-intent
 import { clearWebSessionReorderIntentsForOwner } from '../web-session-reorder-intent'
 import {
   installWindowVisibilitySubscriptionParking,
+  type WindowVisibilitySubscriptionParking,
   type WindowVisibilitySubscriptionSpec
 } from '../window-visibility-subscription-parking'
 import { shouldSyncAllRuntimeSessionTabs } from './tracking-decisions'
@@ -19,7 +20,7 @@ import type {
   MirroredRuntimeEnvironment,
   SessionTabsSnapshotHandler
 } from './visibility-resume-types'
-import { WEB_SESSION_TABS_VISIBILITY_RESUME_STAGGER_MS } from './state'
+import { isSessionTabsStreamEnd, WEB_SESSION_TABS_VISIBILITY_RESUME_STAGGER_MS } from './state'
 import { subscribeRuntimeEnvironment } from '../runtime-environment-pairing-refresh'
 
 type Ref<T> = { current: T }
@@ -62,7 +63,7 @@ export function installGlobalSessionTabsSubscriptions({
   runtimeSessionMirrorEnvironmentKey,
   workspaceSessionReady,
   refs
-}: GlobalSubscriptionInstallArgs): (() => void) | undefined {
+}: GlobalSubscriptionInstallArgs): WindowVisibilitySubscriptionParking | undefined {
   const environments = parseEnvironments(runtimeSessionMirrorEnvironmentKey)
   const ownerRevisions = new Map(
     (workspaceSessionReady ? environments : []).map(
@@ -124,7 +125,7 @@ export function installGlobalSessionTabsSubscriptions({
     const expectedTrackingGeneration = getWebSessionTabsTrackingGeneration(environmentId)
     environmentIdBySpec.push(environmentId)
     subscriptionSpecs.push({
-      subscribe: (isCurrent, { visibilityGeneration }) => {
+      subscribe: (isCurrent, { visibilityGeneration, ended }) => {
         const awaitingVisibilityResumeInventory = { value: visibilityGeneration > 0 }
         if (!requestedInitialLoad) {
           requestedInitialLoad = true
@@ -152,6 +153,10 @@ export function installGlobalSessionTabsSubscriptions({
               ) {
                 return
               }
+              // Why: an end frame never reaches onClose, and an error response leaves the stream dead.
+              if (!response.ok || isSessionTabsStreamEnd(response.result)) {
+                ended()
+              }
               handleGlobalSessionEvent({
                 environmentId,
                 expectedEnvironmentConnectionGeneration,
@@ -170,6 +175,11 @@ export function installGlobalSessionTabsSubscriptions({
             onError: (error) => {
               if (isCurrent()) {
                 console.warn('[web-session-tabs-sync] global subscription error:', error.message)
+              }
+            },
+            onClose: () => {
+              if (isCurrent()) {
+                ended()
               }
             }
           }
@@ -194,16 +204,19 @@ export function installGlobalSessionTabsSubscriptions({
     onVisibilityResume: ({ visibilityGeneration, restartingSpecIndexes }) =>
       coordinator.beginVisibilityResume(visibilityGeneration, restartingSpecIndexes)
   })
-  return () => {
-    refs.snapshotReceipt.current = () => {}
-    refs.snapshotApply.current = () => true
-    refs.snapshotAccepted.current = () => {}
-    dispose()
-    for (const { environmentId, expectedEnvironmentPairingRevision } of environments) {
-      const owner = { environmentId, pairingRevision: expectedEnvironmentPairingRevision }
-      clearWebSessionCloseIntentsForOwner(owner)
-      clearWebSessionFocusIntentsForOwner(owner)
-      clearWebSessionReorderIntentsForOwner(owner)
-    }
-  }
+  return Object.assign(
+    () => {
+      refs.snapshotReceipt.current = () => {}
+      refs.snapshotApply.current = () => true
+      refs.snapshotAccepted.current = () => {}
+      dispose()
+      for (const { environmentId, expectedEnvironmentPairingRevision } of environments) {
+        const owner = { environmentId, pairingRevision: expectedEnvironmentPairingRevision }
+        clearWebSessionCloseIntentsForOwner(owner)
+        clearWebSessionFocusIntentsForOwner(owner)
+        clearWebSessionReorderIntentsForOwner(owner)
+      }
+    },
+    { restartEnded: dispose.restartEnded }
+  )
 }

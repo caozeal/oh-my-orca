@@ -1,4 +1,12 @@
-import type { IPtyProvider, PtySpawnOptions, PtySpawnResult } from '../../../providers/types'
+import type { PtyRegistrationClaim } from '../../../runtime/runtime-terminal-state-records'
+import type { PaneSpawnOperation } from '../pane/pane-spawn-operation'
+import type { AgentLaunchRuntime } from '../../../../shared/agent-launch-runtime'
+import type { SpawnIntent } from '../../../../shared/host-spawn-admission'
+import type {
+  IPtyProvider,
+  PtySpawnOptions,
+  PtySpawnResult
+} from '../../../providers/pty-provider-contract'
 import type { CodexPaneHomeRoute } from '../../../codex/codex-pane-account-registry'
 import type { CodexAccountSelectionTarget } from '../../../codex-accounts/runtime-selection'
 import type { ClaudeRuntimeAuthPreparation } from '../../../claude-accounts/runtime-auth-service'
@@ -16,6 +24,7 @@ import type {
   AgentSessionSurfaceBinding
 } from '../../../../shared/agent-session-host-authority'
 import { localProvider } from '../provider/registry'
+import type { StartupCwdFallback } from '../../../../shared/startup-cwd-fallback'
 
 export type RuntimePtySpawnState = {
   deps: PtyRuntimeControllerDeps
@@ -25,6 +34,10 @@ export type RuntimePtySpawnState = {
   preAdoptedStablePane: AdoptStablePaneResult | null
   reattachedCodexHomeRoutes: Map<string, CodexPaneHomeRoute | null>
   cwd: string | undefined
+  requestedCwd: string | undefined
+  prevalidatedCwd: string | undefined
+  startupCwdFallback: StartupCwdFallback | undefined
+  correctStartupCwd?: string
   provider: IPtyProvider
   isClaudeLaunch: boolean
   terminalRuntimeOptions: { shellOverride?: string; terminalWindowsWslDistro?: string | null }
@@ -33,7 +46,6 @@ export type RuntimePtySpawnState = {
   callerRequestedSessionId: string | undefined
   requestedSessionId: string | undefined
   sessionId: string | undefined
-  effectiveSessionRelayId: string | undefined
   effectiveSessionAppId: string | undefined
   isNewDaemonSession: boolean
   expectedWslDistro: string | null
@@ -55,6 +67,7 @@ export type RuntimePtySpawnState = {
   requestedAgentTeamsPath: string | undefined
   selectedCodexHomePath: string | null
   codexResumeHomeSelected: boolean
+  codexResumeArgvDropped: boolean
   skipCodexHomeEnv: boolean
   stripInheritedOrcaCodexHome: boolean
   spawnOptions: PtySpawnOptions
@@ -75,6 +88,7 @@ export type RuntimePtySpawnState = {
   stablePaneBindingPersisted: boolean
   rejectedRegistrationCandidate: PtySpawnResult | null
   pendingRegistrationPtyId: string | null
+  pendingRegistrationClaim?: PtyRegistrationClaim
   reconciledSnapshotSeq: number | null
   snapshotKittyFlagsCoverReconciledSeq: boolean
   preparedProvisionalExecutionContext: boolean
@@ -106,6 +120,8 @@ export type RuntimePtySpawnArgs = {
   leafId?: string
   sessionId?: string
   shellOverride?: string
+  /** The agent launch's runtime fact; when present the PTY shell comes only from it. */
+  launchRuntime?: AgentLaunchRuntime
   isNewSession?: boolean
   /** No renderer view exists at spawn; main owns delivery and query replies until one mounts. */
   initiallyHidden?: boolean
@@ -119,8 +135,11 @@ export type RuntimePtySpawnArgs = {
     surface: AgentSessionSurfaceBinding
   }
   agentSessionCreateOperationId?: string
+  spawnIntent?: SpawnIntent
   signal?: AbortSignal
+  refuseSleptWorktree?: boolean
   onPtySpawnCommitted?: () => void
+  paneSpawnOperation?: PaneSpawnOperation
   adoptedStablePane?: {
     result: PtySpawnResult
     owner: {
@@ -146,6 +165,9 @@ export function createRuntimePtySpawnState(
     preAdoptedStablePane: null,
     reattachedCodexHomeRoutes: new Map(),
     cwd: undefined,
+    requestedCwd: undefined,
+    prevalidatedCwd: undefined,
+    startupCwdFallback: undefined,
     provider: localProvider,
     isClaudeLaunch: false,
     terminalRuntimeOptions: {},
@@ -154,7 +176,6 @@ export function createRuntimePtySpawnState(
     callerRequestedSessionId: undefined,
     requestedSessionId: undefined,
     sessionId: undefined,
-    effectiveSessionRelayId: undefined,
     effectiveSessionAppId: undefined,
     isNewDaemonSession: false,
     expectedWslDistro: null,
@@ -167,6 +188,7 @@ export function createRuntimePtySpawnState(
     requestedAgentTeamsPath: undefined,
     selectedCodexHomePath: null,
     codexResumeHomeSelected: false,
+    codexResumeArgvDropped: false,
     skipCodexHomeEnv: false,
     stripInheritedOrcaCodexHome: false,
     spawnOptions: { cols: args.cols, rows: args.rows },

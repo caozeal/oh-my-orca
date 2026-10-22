@@ -1,4 +1,5 @@
 import type { OrcaRuntimeService } from '../orca-runtime'
+import { captureStructuredAgentCliSource } from '../../native-chat/structured-agent-cli-source'
 import type { OrchestrationSessionCaller } from '../orchestration/orchestration-caller-identity'
 import { isRegistrationFencedUnsubscribe, type RpcContext, type RpcRequest } from './core'
 import { resolveRpcCallerIdentity } from './rpc-caller-identity'
@@ -11,11 +12,15 @@ export type RpcDispatchStreamingOptions = Pick<
   | 'signal'
   | 'clientId'
   | 'pairedDeviceId'
+  | 'pairedDeviceParentId'
   | 'caller'
   | 'clientKind'
   | 'clientCapabilities'
   | 'updateClientCapabilities'
   | 'pairing'
+  | 'deviceSelf'
+  | 'mobileRelayHosts'
+  | 'delegatedMobileDevices'
   | 'sendBinary'
   | 'registerBinaryStreamHandler'
   | 'registerBinaryMessageHandler'
@@ -40,14 +45,22 @@ export function rpcContextFromTransport(
     subscriptionRegistrationVersion: isRegistrationFencedUnsubscribe(request.method)
       ? runtime.getSubscriptionRegistrationVersion()
       : undefined,
+    structuredAgentCliSourceEvidence:
+      request.method === 'agentSession.create'
+        ? captureStructuredAgentCliSource(() => runtime.getAgentProviderSessionRows())
+        : undefined,
     clientId: options?.clientId,
     pairedDeviceId: options?.pairedDeviceId,
+    pairedDeviceParentId: options?.pairedDeviceParentId,
     caller: resolveRpcCallerIdentity(options),
     clientKind: options?.clientKind,
     clientCapabilities: options?.clientCapabilities,
     updateClientCapabilities: options?.updateClientCapabilities,
     authenticatedCallerFingerprint: options?.authenticatedCallerFingerprint,
     pairing: options?.pairing,
+    deviceSelf: options?.deviceSelf,
+    mobileRelayHosts: options?.mobileRelayHosts,
+    delegatedMobileDevices: options?.delegatedMobileDevices,
     sendBinary: options?.sendBinary,
     registerBinaryStreamHandler: options?.registerBinaryStreamHandler,
     registerBinaryMessageHandler: options?.registerBinaryMessageHandler,

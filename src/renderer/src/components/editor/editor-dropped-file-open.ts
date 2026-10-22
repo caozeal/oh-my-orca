@@ -4,39 +4,23 @@ import { isPathInsideWorktree, toWorktreeRelativePath } from '@/lib/terminal-lin
 import { useAppStore } from '@/store'
 import { getConnectionId } from '@/lib/connection-context'
 import { joinPath } from '@/lib/path'
-import {
-  getRuntimeEnvironmentIdForWorktree,
-  type WorktreeRuntimeOwnerState
-} from '@/lib/worktree-runtime-owner'
-import {
-  importExternalPathsToRuntime,
-  type RuntimeFileOperationArgs
-} from '@/runtime/runtime-file-client'
-import type { GlobalSettings } from '../../../../shared/global-settings-types'
+import type { WorktreeRuntimeOwnerState } from '@/lib/worktree-runtime-owner-state'
+import { importExternalPathsToRuntime } from '@/runtime/runtime-file-import-client'
+import type { RuntimeFileOperationArgs } from '@/runtime/runtime-file-client-types'
+import { runtimeTargetEnvironmentId } from '@/runtime/runtime-client-target'
+import type { RuntimeClientTarget } from '../../../../shared/runtime-client-target'
 import { translate } from '@/i18n/i18n'
 import { captureWorktreeSshMutationExpectation } from '@/lib/ssh-mutation-expectation'
 import { statUserOpenedPath } from '@/lib/user-opened-local-path'
 import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
-import { openDocumentInFloatingWorkspace } from '@/lib/open-document-in-floating-workspace'
-
-export function getEditorFileDropSettingsForWorktree(
-  store: WorktreeRuntimeOwnerState,
-  worktreeId: string
-): Pick<GlobalSettings, 'activeRuntimeEnvironmentId'> {
-  const runtimeEnvironmentId = getRuntimeEnvironmentIdForWorktree(store, worktreeId)
-  // Why: OS drops target the selected worktree. Use that worktree's host owner
-  // so a focused runtime cannot hijack local/SSH editor drops.
-  return {
-    ...store.settings,
-    activeRuntimeEnvironmentId: runtimeEnvironmentId
-  }
-}
+import { requireRuntimeTargetForFileOwner } from '@/lib/file-owner-runtime-target'
+import { openWorkspaceFile } from '@/lib/workspace-file-open'
 
 export function shouldUploadRemoteEditorFileDrop(
-  settings: Pick<GlobalSettings, 'activeRuntimeEnvironmentId'> | null | undefined,
+  target: RuntimeClientTarget,
   connectionId: string | null | undefined
 ): boolean {
-  return Boolean(settings?.activeRuntimeEnvironmentId?.trim() || connectionId?.trim())
+  return target.kind === 'environment' || Boolean(connectionId?.trim())
 }
 
 export function getEditorFileDropOperationContext(
@@ -46,7 +30,8 @@ export function getEditorFileDropOperationContext(
   connectionId: string | undefined
 ): RuntimeFileOperationArgs {
   return {
-    settings: getEditorFileDropSettingsForWorktree(store, worktreeId),
+    // Why: OS drops target the selected worktree's owner, never the focused server.
+    target: requireRuntimeTargetForFileOwner(store, worktreeId, undefined),
     worktreeId,
     worktreePath,
     connectionId
@@ -89,7 +74,7 @@ function sameEditorFileDropOwner(a: EditorFileDropContext, b: EditorFileDropCont
   return (
     a.worktreePath === b.worktreePath &&
     a.connectionId === b.connectionId &&
-    left.settings?.activeRuntimeEnvironmentId === right.settings?.activeRuntimeEnvironmentId &&
+    runtimeTargetEnvironmentId(left.target) === runtimeTargetEnvironmentId(right.target) &&
     left.expectedExecutionHostId === right.expectedExecutionHostId &&
     left.expectedSshTargetId === right.expectedSshTargetId &&
     left.expectedSshConnectionGeneration === right.expectedSshConnectionGeneration
@@ -116,6 +101,21 @@ export function editorGroupStillExists({
   return groups.some((group) => group.id === groupId)
 }
 
+function canOpenEditorFileDrop(
+  captured: EditorFileDropContext,
+  destination: EditorFileDropDestination
+): boolean {
+  if (!editorGroupStillExists(destination)) {
+    return false
+  }
+  const current = captureEditorFileDropContext(destination.worktreeId)
+  if (!current || !sameEditorFileDropOwner(captured, current)) {
+    showOwnerChangedError()
+    return false
+  }
+  return true
+}
+
 /**
  * Captures the destination workspace's host at drop time and returns the open
  * step; a host change before preparation finishes refuses instead of re-routing.
@@ -129,12 +129,7 @@ export function captureEditorFileDropOpen(
     return async () => undefined
   }
   return async (paths) => {
-    if (paths.length === 0 || !editorGroupStillExists(destination)) {
-      return
-    }
-    const current = captureEditorFileDropContext(destination.worktreeId)
-    if (!current || !sameEditorFileDropOwner(captured, current)) {
-      showOwnerChangedError()
+    if (paths.length === 0 || !canOpenEditorFileDrop(captured, destination)) {
       return
     }
     await openEditorFileDropPaths(captured, destination, paths)
@@ -142,16 +137,15 @@ export function captureEditorFileDropOpen(
 }
 
 async function openEditorFileDropPaths(
-  { fileContext, worktreePath, connectionId }: EditorFileDropContext,
+  context: EditorFileDropContext,
   destination: EditorFileDropDestination,
   paths: readonly string[]
 ): Promise<void> {
-  const store = useAppStore.getState()
+  const { fileContext, worktreePath, connectionId } = context
   const { worktreeId, groupId } = destination
   const groupOptions = groupId ? { targetGroupId: groupId } : null
-  const dropSettings = fileContext.settings
-  const runtimeEnvironmentId = dropSettings?.activeRuntimeEnvironmentId ?? null
-  if (shouldUploadRemoteEditorFileDrop(dropSettings, connectionId)) {
+  const runtimeEnvironmentId = runtimeTargetEnvironmentId(fileContext.target)
+  if (shouldUploadRemoteEditorFileDrop(fileContext.target, connectionId)) {
     if (!worktreePath) {
       toast.error(
         translate(
@@ -169,22 +163,19 @@ async function openEditorFileDropPaths(
         fileContext,
         [...paths],
         destinationDir,
-        { ensureDestinationDir: true }
+        { ensureDestinationDir: true, nameExtensionlessImages: true }
       )
-      if (!editorGroupStillExists(destination)) {
-        return
-      }
       for (const result of results) {
-        if (!editorGroupStillExists(destination)) {
+        if (!canOpenEditorFileDrop(context, destination)) {
           return
         }
         if (result.status !== 'imported' || result.kind === 'directory') {
           continue
         }
         const maybeRelative = toWorktreeRelativePath(result.destPath, worktreePath)
-        store.setActiveTabType('editor', worktreeId)
-        store.openFile(
-          {
+        openWorkspaceFile({
+          kind: 'file',
+          file: {
             filePath: result.destPath,
             relativePath: maybeRelative ?? result.destPath,
             worktreeId,
@@ -192,8 +183,8 @@ async function openEditorFileDropPaths(
             language: detectLanguage(result.destPath),
             mode: 'edit'
           },
-          { suppressActiveRuntimeFallback: runtimeEnvironmentId === null, ...groupOptions }
-        )
+          options: { suppressActiveRuntimeFallback: runtimeEnvironmentId === null, ...groupOptions }
+        })
       }
       if (results.some((result) => result.status !== 'imported')) {
         toast.error(
@@ -215,7 +206,7 @@ async function openEditorFileDropPaths(
   for (const filePath of paths) {
     try {
       const stat = await statUserOpenedPath(fileContext, filePath)
-      if (!editorGroupStillExists(destination)) {
+      if (!canOpenEditorFileDrop(context, destination)) {
         return
       }
       if (stat.isDirectory) {
@@ -230,27 +221,22 @@ async function openEditorFileDropPaths(
           relativePath = maybeRelative
         }
       }
-      store.setActiveTabType('editor', worktreeId)
-      if (worktreeId === FLOATING_TERMINAL_WORKTREE_ID) {
-        openDocumentInFloatingWorkspace(
-          store.openFile,
-          { filePath, relativePath },
-          groupOptions ?? {}
-        )
-        continue
-      }
-      const file = {
-        filePath,
-        relativePath,
-        worktreeId,
-        language: detectLanguage(filePath),
-        mode: 'edit' as const
-      }
-      if (groupOptions) {
-        store.openFile(file, groupOptions)
-      } else {
-        store.openFile(file)
-      }
+      const floating = worktreeId === FLOATING_TERMINAL_WORKTREE_ID
+      openWorkspaceFile({
+        kind: 'file',
+        file: {
+          filePath,
+          relativePath,
+          worktreeId,
+          language: detectLanguage(filePath),
+          mode: 'edit',
+          ...(floating ? { runtimeEnvironmentId: null } : {})
+        },
+        options: {
+          ...groupOptions,
+          ...(floating ? { preview: false, suppressActiveRuntimeFallback: true } : {})
+        }
+      })
     } catch {
       // Ignore files that cannot be stat'd.
     }

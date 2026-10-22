@@ -35,8 +35,8 @@ function context(): StructuredAgentModelCatalogContext {
     deps: { stateDirectory: '/state' } as StructuredAgentModelCatalogContext['deps'],
     environment: {
       resolveBaseEnvironment: unused,
-      resolveCodexEnvironment: unused,
-      resolveClaudeInheritedEnv: unused
+      resolveAgentEnvironment: unused,
+      refreshAfterMissingProgram: unused
     }
   }
 }
@@ -90,7 +90,7 @@ function service(
   )
   const probes: Record<string, AgentModelCatalogProbe> = {}
   for (const [agent, models] of Object.entries(listings)) {
-    probes[agent] = async () => ({ models, fastModeTierByModel: new Map(), origin: 'probe' })
+    probes[agent] = async () => ({ models, origin: 'probe' })
   }
   return createAgentModelCatalogService({
     store,
@@ -136,7 +136,7 @@ describe('a new chat’s first frame from the host catalog', () => {
     expect(host).toMatchObject({ origin: 'probe', listingNamesConfiguredModel: false })
     expect(model?.choices.map((choice) => choice.value)).toEqual(['grok-4', 'grok-3-mini'])
     expect(model?.currentValue).toBeUndefined()
-    expect(state.record.model).toBeUndefined()
+    expect(state.record.values.model).toBeUndefined()
   })
 
   it('lists a warm Pi account’s models without naming one its listing does not name', async () => {
@@ -210,7 +210,6 @@ describe('a running chat’s listing, saved for the next chat', () => {
       'opencode',
       {
         models: listed,
-        fastModeTierByModel: new Map(),
         origin: 'probe'
       },
       'discovery'
@@ -226,16 +225,5 @@ describe('a running chat’s listing, saved for the next chat', () => {
       [{ value: 'high', label: 'High' }],
       [{ value: 'low', label: 'Low' }]
     ])
-  })
-
-  it('saves a Claude live listing through the same step as every other agent', async () => {
-    const store = new AgentModelCatalogStore()
-    const record = { ...grokRecord(), provider: 'claude', accountHome: HOMES.claude! }
-    const catalog = service(store, {}, [record])
-    catalog.recordLiveListing(record.sessionId, {
-      models: [{ id: 'opus', label: 'Opus', isDefault: false, efforts: [] }]
-    })
-    const read = await catalog.read({ agent: 'claude', sessionId: record.sessionId })
-    expect(read.origin === 'unknown' ? null : read.models.map((m) => m.id)).toEqual(['opus'])
   })
 })

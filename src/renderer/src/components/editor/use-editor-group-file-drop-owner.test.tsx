@@ -12,7 +12,6 @@ const mocks = vi.hoisted(() => {
   const groupsByWorktree: Record<string, { id: string }[]> = {}
   return {
     openFile: vi.fn(),
-    setActiveTabType: vi.fn(),
     stat: vi.fn(),
     prepare: vi.fn(),
     toastError: vi.fn(),
@@ -34,9 +33,20 @@ vi.mock('@/lib/ssh-mutation-expectation', () => ({
     return { expectedExecutionHostId: 'local' }
   }
 }))
-vi.mock('@/lib/worktree-runtime-owner', () => ({
-  getRuntimeEnvironmentIdForWorktree: () => null
-}))
+vi.mock('@/lib/file-owner-runtime-target', () => {
+  const getRuntimeTargetForFileOwner = (
+    _state: unknown,
+    _worktreeId: string | null | undefined,
+    _runtimeEnvironmentId: string | null | undefined
+  ) => ({ kind: 'local' as const })
+  return {
+    FILE_OWNER_UNRESOLVED_MESSAGE: 'unresolved',
+    getRuntimeTargetForFileOwner,
+    requireRuntimeTargetForFileOwner: getRuntimeTargetForFileOwner,
+    getRuntimeTargetForWorktreeOwner: (state: unknown, worktreeId: string | null | undefined) =>
+      getRuntimeTargetForFileOwner(state, worktreeId, undefined)
+  }
+})
 vi.mock('@/lib/user-opened-local-path', () => ({ statUserOpenedPath: mocks.stat }))
 vi.mock('@/store', () => ({
   useAppStore: {
@@ -45,7 +55,6 @@ vi.mock('@/store', () => ({
       activeWorktreeId: 'wt-active',
       groupsByWorktree: mocks.groupsByWorktree,
       getKnownWorktreeById: (id: string) => ({ id, path: `/repos/${id}` }),
-      setActiveTabType: mocks.setActiveTabType,
       openFile: mocks.openFile
     })
   }
@@ -138,7 +147,6 @@ describe('editor group OS file drops', () => {
         }),
         { targetGroupId: 'group-b' }
       )
-      expect(mocks.setActiveTabType).toHaveBeenCalledWith('editor', 'wt-b')
     }
   )
 
@@ -251,7 +259,6 @@ describe('editor group OS file drops', () => {
       }
       await act(async () => finish({ isDirectory: false, escapesWorktree: false }))
       expect(mocks.openFile).not.toHaveBeenCalled()
-      expect(mocks.setActiveTabType).not.toHaveBeenCalled()
       expect(mocks.toastError).toHaveBeenCalledTimes(1)
     }
   )

@@ -2,15 +2,16 @@ import { beforeEach, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => {
   const route: {
     current: {
-      settings: { activeRuntimeEnvironmentId: string | null }
+      target: { kind: 'local' } | { kind: 'environment'; environmentId: string }
       connectionId: string | undefined
     }
-  } = { current: { settings: { activeRuntimeEnvironmentId: null }, connectionId: undefined } }
+  } = { current: { target: { kind: 'local' }, connectionId: undefined } }
   return {
     stat: vi.fn(),
     authorize: vi.fn(),
     open: vi.fn(() => 'owner-file-id'),
     source: vi.fn(),
+    preview: vi.fn(),
     reveal: vi.fn(),
     assertCurrent: vi.fn(),
     rpc: vi.fn(),
@@ -26,11 +27,17 @@ vi.mock('@/store', () => ({
     })
   }
 }))
-vi.mock('@/runtime/runtime-file-client', () => ({
+vi.mock('@/lib/file-preview', () => ({
+  openFileInBrowserTab: mocks.preview,
+  getWorkspaceFilePreviewPlan: () => ({ status: 'browser-tab' })
+}))
+vi.mock('@/runtime/runtime-file-metadata-client', () => ({
   statRuntimePath: mocks.stat,
-  isRemoteRuntimeFileOperation: (context: { connectionId?: string }) =>
-    Boolean(context.connectionId),
   isMissingRuntimePathError: (error: Error) => error.message.includes('ENOENT')
+}))
+vi.mock('@/runtime/runtime-file-routing', () => ({
+  isRemoteRuntimeFileOperation: (context: { connectionId?: string }) =>
+    Boolean(context.connectionId)
 }))
 vi.mock('./right-sidebar/file-explorer-operation-owner', () => ({
   getFileExplorerOperationOwner: () => ({}),
@@ -39,13 +46,7 @@ vi.mock('./right-sidebar/file-explorer-operation-owner', () => ({
     assertCurrent: mocks.assertCurrent
   })
 }))
-vi.mock('@/runtime/runtime-rpc-client', () => ({
-  getActiveRuntimeTarget: (settings: { activeRuntimeEnvironmentId: string | null }) =>
-    settings.activeRuntimeEnvironmentId
-      ? { kind: 'environment', environmentId: settings.activeRuntimeEnvironmentId }
-      : { kind: 'local' },
-  callRuntimeRpc: mocks.rpc
-}))
+vi.mock('@/runtime/runtime-rpc-client', () => ({ callRuntimeRpc: mocks.rpc }))
 vi.mock('@/store/slices/editor/focus/editor-focus-reveal', () => ({
   scheduleEditorLineReveal: mocks.reveal
 }))
@@ -53,10 +54,37 @@ import { openQuickOpenFile } from './quick-open-file-navigation'
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mocks.route.current = { settings: { activeRuntimeEnvironmentId: null }, connectionId: undefined }
+  mocks.route.current = { target: { kind: 'local' }, connectionId: undefined }
   mocks.stat.mockResolvedValue({ isDirectory: false })
   mocks.assertCurrent.mockReset()
+  mocks.preview.mockReturnValue({ status: 'unsupported' })
   vi.stubGlobal('window', { api: { fs: { authorizeExternalPath: mocks.authorize } } })
+})
+
+it('previews an HTML file selected without a line destination', async () => {
+  mocks.preview.mockReturnValue({ status: 'browser-tab' })
+  await openQuickOpenFile('report.html', 'wt', '/repo', { pathQuery: 'report.html' })
+  expect(mocks.preview).toHaveBeenCalledWith({ filePath: '/repo/report.html', worktreeId: 'wt' })
+  expect(mocks.open).not.toHaveBeenCalled()
+  expect(mocks.reveal).not.toHaveBeenCalled()
+})
+
+it('opens HTML at the requested source line even when a preview is available', async () => {
+  mocks.preview.mockReturnValue({ status: 'browser-tab' })
+  await openQuickOpenFile('report.html', 'wt', '/repo', {
+    pathQuery: 'report.html',
+    line: 12,
+    column: 3
+  })
+  expect(mocks.preview).not.toHaveBeenCalled()
+  expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ language: 'html' }), undefined)
+  expect(mocks.reveal).toHaveBeenCalledWith(
+    expect.any(Function),
+    '/repo/report.html',
+    12,
+    3,
+    'owner-file-id'
+  )
 })
 
 it('validates pasted local paths with user-named access and uses the owner-qualified reveal', async () => {
@@ -73,7 +101,8 @@ it('validates pasted local paths with user-named access and uses the owner-quali
       filePath: '/external/guide.md',
       relativePath: '/external/guide.md',
       runtimeEnvironmentId: null
-    })
+    }),
+    undefined
   )
   expect(mocks.source).toHaveBeenCalledWith('owner-file-id', 'source')
   expect(mocks.reveal).toHaveBeenCalledWith(
@@ -93,7 +122,10 @@ it('keeps a literal colon filename when it exists instead of applying its appare
     { pathQuery: '/repo/report', line: 12 },
     '/repo/report:12'
   )
-  expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ filePath: '/repo/report:12' }))
+  expect(mocks.open).toHaveBeenCalledWith(
+    expect.objectContaining({ filePath: '/repo/report:12' }),
+    undefined
+  )
   expect(mocks.reveal).not.toHaveBeenCalled()
 })
 
@@ -106,7 +138,10 @@ it('falls back from a missing literal colon filename to line navigation', async 
     { pathQuery: '/repo/file.ts', line: 12 },
     '/repo/file.ts:12'
   )
-  expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ filePath: '/repo/file.ts' }))
+  expect(mocks.open).toHaveBeenCalledWith(
+    expect.objectContaining({ filePath: '/repo/file.ts' }),
+    undefined
+  )
   expect(mocks.reveal).toHaveBeenCalledWith(
     expect.any(Function),
     '/repo/file.ts',
@@ -125,11 +160,14 @@ it('probes SSH paths only on their owning host', async () => {
     '/external/file.ts',
     { kind: 'user-file' }
   )
-  expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ externalSshTargetId: 'ssh-a' }))
+  expect(mocks.open).toHaveBeenCalledWith(
+    expect.objectContaining({ externalSshTargetId: 'ssh-a' }),
+    undefined
+  )
 })
 
 it('resolves paired paths on the host and never falls back to client filesystem access', async () => {
-  mocks.route.current.settings.activeRuntimeEnvironmentId = 'env-a'
+  mocks.route.current.target = { kind: 'environment', environmentId: 'env-a' }
   mocks.rpc.mockResolvedValue({
     exists: true,
     isDirectory: false,
@@ -140,7 +178,8 @@ it('resolves paired paths on the host and never falls back to client filesystem 
   expect(mocks.stat).not.toHaveBeenCalled()
   expect(mocks.authorize).not.toHaveBeenCalled()
   expect(mocks.open).toHaveBeenCalledWith(
-    expect.objectContaining({ runtimeEnvironmentId: 'env-a', relativePath: 'file.ts' })
+    expect.objectContaining({ runtimeEnvironmentId: 'env-a', relativePath: 'file.ts' }),
+    undefined
   )
   mocks.rpc.mockResolvedValue({
     exists: true,
@@ -189,7 +228,7 @@ it.each(['C:\\repo\\file.ts', '\\\\server\\share\\file.ts'])(
 )
 
 it('resolves literal colon names on a paired host before treating the suffix as navigation', async () => {
-  mocks.route.current.settings.activeRuntimeEnvironmentId = 'env-a'
+  mocks.route.current.target = { kind: 'environment', environmentId: 'env-a' }
   mocks.rpc.mockResolvedValueOnce({
     exists: true,
     isDirectory: false,
@@ -204,7 +243,10 @@ it('resolves literal colon names on a paired host before treating the suffix as 
     '/repo/report:12'
   )
   expect(mocks.rpc).toHaveBeenCalledOnce()
-  expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ filePath: '/repo/report:12' }))
+  expect(mocks.open).toHaveBeenCalledWith(
+    expect.objectContaining({ filePath: '/repo/report:12' }),
+    undefined
+  )
   expect(mocks.reveal).not.toHaveBeenCalled()
   expect(mocks.stat).not.toHaveBeenCalled()
 })
@@ -224,7 +266,10 @@ it('keeps a pasted POSIX file on the local workspace WSL distro before any files
     expect.anything(),
     '\\\\wsl.localhost\\Ubuntu\\home\\repo\\file.ts'
   )
-  expect(mocks.open).toHaveBeenCalledWith(expect.objectContaining({ relativePath: 'file.ts' }))
+  expect(mocks.open).toHaveBeenCalledWith(
+    expect.objectContaining({ relativePath: 'file.ts' }),
+    undefined
+  )
   mocks.route.current.connectionId = 'ssh-a'
   await openQuickOpenFile('/home/repo/file.ts', 'wt', '\\\\wsl.localhost\\Ubuntu\\home\\repo', {
     pathQuery: '/home/repo/file.ts'
@@ -248,7 +293,8 @@ it.each(['literal:12', 'nested/literal:12', 'literal:12:3'])(
       query
     )
     expect(mocks.open).toHaveBeenCalledWith(
-      expect.objectContaining({ filePath: `/repo/${selected}` })
+      expect.objectContaining({ filePath: `/repo/${selected}` }),
+      undefined
     )
     expect(mocks.reveal).not.toHaveBeenCalled()
   }

@@ -2,6 +2,7 @@
 import { ZodError, type ZodType } from 'zod'
 import type { TerminalStreamFrame } from '../../../shared/terminal-stream-protocol'
 import type { OrcaRuntimeService, OrchestrationCompatibilityCallerAuthority } from '../orca-runtime'
+import type { StructuredAgentCliSourceEvidence } from '../../native-chat/structured-agent-cli-source'
 import type {
   DeviceCredentialInstalled,
   PairingGetEndpointsParams,
@@ -9,10 +10,28 @@ import type {
   PairingProvisionRelayParams
 } from '../../../shared/mobile-relay-credential-contract'
 import type { RuntimeCapability } from '../../../shared/protocol-version'
+import type {
+  MobileRelayHostsListResult,
+  MobileRelayHostWorktreesResult
+} from '../../../shared/mobile-relay-hosts-contract'
+import type {
+  DelegatedPhone,
+  DelegatedMobileDeviceSyncResult
+} from '../../../shared/delegated-mobile-device-contract'
 import type { OrchestrationCompatibilityEvidence } from '../../../shared/orchestration-compatibility-evidence'
 import type { OrchestrationSessionCaller } from '../orchestration/orchestration-caller-identity'
 import type { RpcCallerIdentity } from './rpc-caller-identity'
+import type { RpcBinarySender } from './rpc-binary-sender'
 import type { RpcMethodPermission } from './rpc-method-permission'
+import type {
+  RegisterDeviceKeyParams,
+  RegisterDeviceKeyResult
+} from '../../../shared/device-key-registration-contract'
+
+// Why: bound to the authenticated socket by the transport, so a caller can only re-key itself.
+export type DeviceSelfRpcContext = {
+  registerDeviceKey(params: RegisterDeviceKeyParams): RegisterDeviceKeyResult
+}
 
 export type PairingRpcContext = {
   getEndpoints(params: PairingGetEndpointsParams): Promise<PairingGetEndpointsResult>
@@ -53,6 +72,10 @@ export type RpcRequest = {
   orchestrationRequestId?: string
   compatibilityInvocationId?: string
   orchestrationCompatibilityEvidence?: OrchestrationCompatibilityEvidence
+  // Why unknown: untrusted wire input; runtime-source-admission.ts validates it.
+  expectedRuntimeSource?: unknown
+  // Why unknown: phone-supplied routing target (`runtime:<env>`), validated where it is read.
+  executionHost?: unknown
 }
 
 export type LegacyCoordinatorAuthorityProof = Readonly<{
@@ -71,12 +94,15 @@ export type RpcContext = {
   connectionId?: string
   // An unsubscribe cannot retire a registration created after its dispatch began.
   subscriptionRegistrationVersion?: number
+  structuredAgentCliSourceEvidence?: StructuredAgentCliSourceEvidence
   // Why: shared-control multiplexes many logical streams over one socket; the frame id lets handlers register cleanup per logical stream.
   requestId?: string
   // Why: paired mobile device token; state-owning handlers use it to clean up when that device disconnects.
   clientId?: string
   // Why: navigation is keyed by revocable device identity, never by the bearer credential or transient socket id.
   pairedDeviceId?: string
+  // Why: a delegated phone's desktop device; its workspaces are that desktop's, not this host's.
+  pairedDeviceParentId?: string
   // Why: host-assigned from the transport (rpc-caller-identity.ts); absent when the transport could not name its caller.
   caller?: RpcCallerIdentity
   // Why: lets handlers gate mobile payload truncation to phones only; undefined for in-process callers → treat as full-class (no clip).
@@ -112,8 +138,18 @@ export type RpcContext = {
   // Why: federation pins the authenticated saved-environment caller without exposing its token to handlers or storage.
   authenticatedCallerFingerprint?: string
   pairing?: PairingRpcContext
+  deviceSelf?: DeviceSelfRpcContext
+  // Why: set only on a desktop that relays; it lists the configured servers it shows.
+  mobileRelayHosts?: {
+    list(): MobileRelayHostsListResult
+    worktrees(hostId: string): Promise<MobileRelayHostWorktreesResult>
+  }
+  // Why: set only for an authenticated runtime-scope device and bound to it, so it manages only its own phones.
+  delegatedMobileDevices?: {
+    sync(phones: readonly DelegatedPhone[]): DelegatedMobileDeviceSyncResult
+  }
   // Why: mobile terminal traffic bypasses JSON streaming; undefined on Unix/socket and non-E2EE WebSocket paths.
-  sendBinary?: (bytes: Uint8Array<ArrayBufferLike>) => boolean | void
+  sendBinary?: RpcBinarySender
   // Why: binary terminal frames arrive outside JSON-RPC once a stream is established; handlers register only the stream IDs they created.
   registerBinaryStreamHandler?: (
     streamId: number,

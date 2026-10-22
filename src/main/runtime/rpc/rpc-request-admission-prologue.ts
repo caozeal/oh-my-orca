@@ -9,12 +9,11 @@ import type {
 import { errorResponse } from './errors'
 import type { OrcaRuntimeService } from '../orca-runtime'
 import { orchestrationMigrationFence } from './orchestration-contract-fence'
+import { runtimeSourceFence } from './runtime-source-admission'
 import type { RpcDispatchStreamingOptions } from './dispatcher-stream-options'
 import { mapDispatcherError } from './dispatcher-error-response'
 import { parseRpcRequestParams } from './dispatcher-request-parsing'
-import type { SshBridgeCallBinding } from './ssh-bridge-host-binding'
 import {
-  bindRpcCallToCallerScope,
   denyRpcMethodForCaller,
   OWNER_RPC_CALLER_SCOPE,
   type RpcCallerScope
@@ -32,7 +31,7 @@ type RpcRequestAdmissionDeps = {
   pinnedCallerScope?: RpcCallerScope
 }
 
-// Why: both transports must reject, resolve and bind a request in the same order before any handler runs.
+// Why: both transports must reject and resolve a request in the same order before any handler runs.
 export function admitRpcRequest<M extends RpcMethod | RpcStreamingMethod>(
   { runtime, registry, meta, pinnedCallerScope }: RpcRequestAdmissionDeps,
   rawRequest: RpcRequest,
@@ -50,6 +49,10 @@ export function admitRpcRequest<M extends RpcMethod | RpcStreamingMethod>(
     return reject(
       errorResponse(rawRequest.id, meta, 'method_not_found', `Unknown method: ${rawRequest.method}`)
     )
+  }
+  const sourceFence = runtimeSourceFence(rawRequest, meta)
+  if (sourceFence) {
+    return reject(sourceFence)
   }
   const migrationFence = orchestrationMigrationFence(rawRequest, meta)
   if (migrationFence) {
@@ -71,14 +74,7 @@ export function admitRpcRequest<M extends RpcMethod | RpcStreamingMethod>(
         )
       )
     }
-    const params = parsedParams.value
-    const admit = (binding: SshBridgeCallBinding | null) =>
-      binding?.kind === 'denied'
-        ? reject(errorResponse(request.id, meta, 'forbidden', binding.message))
-        : { method, request, caller, params, binding }
-    // Why: an unbound call stays synchronous, so dispatch gains no extra tick before the handler.
-    const pendingBinding = bindRpcCallToCallerScope(callerScope, runtime, request.method, params)
-    return pendingBinding ? pendingBinding.then(admit) : admit(null)
+    return { method, request, caller, params: parsedParams.value }
   }
   // Why: before params parse and the unary/streaming split, so both branches see one caller.
   return needsOrchestrationCallerResolution(rawRequest)

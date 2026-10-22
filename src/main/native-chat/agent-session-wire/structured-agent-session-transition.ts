@@ -26,7 +26,7 @@ import { structuredAgentSessionJournalAppendOptions } from './structured-agent-s
 /** What a transition step reads: rows by key, every row, and the turns they joined. */
 export type StructuredAgentSessionTransitionJournal = Pick<
   AgentSessionJournal,
-  'epoch' | 'visitItems' | 'itemBody' | 'item' | 'visitItemsWithLinkage'
+  'epoch' | 'visitItems' | 'itemBody' | 'item' | 'visitItemsWithLinkage' | 'canonicalItemId'
 >
 
 export type StructuredAgentSessionTransitionStep =
@@ -45,6 +45,7 @@ export type StructuredAgentSessionTransitionStep =
       kind: 'settlement'
       /** Unique per settlement: the journal applies one id once. */
       settlementId: string
+      recovered?: true
       /** Paces the queue only; the mutations are the journal's to choose. */
       reservedBytes: number
       /** Read at execution; none writes nothing. */
@@ -118,6 +119,8 @@ function transitionAppend(
                   batch: {
                     settlementId: step.settlementId,
                     fence,
+                    ownerFence: fence,
+                    recovered: step.recovered,
                     resolve: () => step.resolve(journal)
                   }
                 }
