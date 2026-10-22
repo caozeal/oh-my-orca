@@ -7,22 +7,25 @@ const {
   chmodSyncMock,
   connectMacOSProviderSocketMock,
   mkdtempSyncMock,
-  resolveMacOSComputerUseExecutablePathMock,
+  resolveMacOSComputerUseAppPathMock,
   rmSyncMock,
   spawnMock,
+  spawnSyncMock,
   writeFileSyncMock
 } = vi.hoisted(() => ({
   chmodSyncMock: vi.fn(),
   connectMacOSProviderSocketMock: vi.fn(),
   mkdtempSyncMock: vi.fn(),
-  resolveMacOSComputerUseExecutablePathMock: vi.fn(),
+  resolveMacOSComputerUseAppPathMock: vi.fn(),
   rmSyncMock: vi.fn(),
   spawnMock: vi.fn(),
+  spawnSyncMock: vi.fn(),
   writeFileSyncMock: vi.fn()
 }))
 
 vi.mock('child_process', () => ({
-  spawn: spawnMock
+  spawn: spawnMock,
+  spawnSync: spawnSyncMock
 }))
 
 vi.mock('fs', () => ({
@@ -33,7 +36,7 @@ vi.mock('fs', () => ({
 }))
 
 vi.mock('./macos-native-provider-paths', () => ({
-  resolveMacOSComputerUseExecutablePath: resolveMacOSComputerUseExecutablePathMock
+  resolveMacOSComputerUseAppPath: resolveMacOSComputerUseAppPathMock
 }))
 
 vi.mock('./macos-native-provider-socket', () => ({
@@ -64,6 +67,7 @@ class FakeSocket extends EventEmitter {
 }
 
 class FakeProvider extends EventEmitter {
+  stderr = null
   exitCode: number | null = null
   signalCode: string | null = null
   kill = vi.fn()
@@ -99,14 +103,13 @@ describe('MacOSNativeProviderClient', () => {
     sockets.length = 0
     providers.length = 0
     mkdtempSyncMock.mockImplementation((prefix: string) => `${prefix}${sockets.length}`)
-    resolveMacOSComputerUseExecutablePathMock.mockReturnValue(
-      '/Applications/Orca Computer Use.app/Contents/MacOS/orca-computer-use-macos'
-    )
+    resolveMacOSComputerUseAppPathMock.mockReturnValue('/Applications/Orca Computer Use.app')
     spawnMock.mockImplementation(() => {
       const provider = new FakeProvider()
       providers.push(provider)
       return provider
     })
+    spawnSyncMock.mockReturnValue({ status: 0 })
     connectMacOSProviderSocketMock.mockImplementation(async () => {
       const socket = new FakeSocket()
       sockets.push(socket)
@@ -123,9 +126,10 @@ describe('MacOSNativeProviderClient', () => {
     chmodSyncMock.mockReset()
     connectMacOSProviderSocketMock.mockReset()
     mkdtempSyncMock.mockReset()
-    resolveMacOSComputerUseExecutablePathMock.mockReset()
+    resolveMacOSComputerUseAppPathMock.mockReset()
     rmSyncMock.mockReset()
     spawnMock.mockReset()
+    spawnSyncMock.mockReset()
     writeFileSyncMock.mockReset()
     vi.useRealTimers()
   })
@@ -509,7 +513,7 @@ describe('MacOSNativeProviderClient', () => {
     await expect(secondCall).resolves.toMatchObject({ protocolVersion: 1 })
   })
 
-  it('terminates the helper process when socket startup fails', async () => {
+  it('launches the helper app through LaunchServices and stops it when socket startup fails', async () => {
     const provider = new FakeProvider()
     spawnMock.mockReturnValueOnce(provider)
     connectMacOSProviderSocketMock.mockRejectedValueOnce(new Error('socket did not open'))
@@ -518,6 +522,17 @@ describe('MacOSNativeProviderClient', () => {
 
     await expect(client.capabilities()).rejects.toThrow('socket did not open')
 
+    const socketDirectory = mkdtempSyncMock.mock.results[0]?.value as string
+    expect(spawnMock).toHaveBeenCalledWith(
+      '/usr/bin/open',
+      expect.arrayContaining(['-n', '/Applications/Orca Computer Use.app', '--args', '--agent']),
+      { detached: true, stdio: ['ignore', 'ignore', 'pipe'] }
+    )
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      '/usr/bin/pkill',
+      ['-f', `orca-computer-use-macos --agent ${join(socketDirectory, 'provider.sock')}`],
+      { stdio: 'ignore' }
+    )
     expect(provider.kill).toHaveBeenCalledWith('SIGTERM')
     expect(rmSyncMock).toHaveBeenCalledWith(expect.stringContaining('orca-computer-use-'), {
       recursive: true,
@@ -541,14 +556,18 @@ describe('MacOSNativeProviderClient', () => {
 
     await expect(call).rejects.toThrow('native macOS helper app failed to start: helper missing')
     expect(connectSignal.aborted).toBe(true)
-    expect(providers[0]!.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      '/usr/bin/pkill',
+      ['-f', `orca-computer-use-macos --agent ${join(socketDirectory, 'provider.sock')}`],
+      { stdio: 'ignore' }
+    )
     expect(rmSyncMock).toHaveBeenCalledWith(socketDirectory, {
       recursive: true,
       force: true
     })
   })
 
-  it('rejects helper exits before socket connection and aborts the pending connect', async () => {
+  it('rejects a non-zero launch command exit and aborts the pending connect', async () => {
     const { MacOSNativeProviderClient } = await loadClientModule()
     const client = new MacOSNativeProviderClient()
     connectMacOSProviderSocketMock.mockImplementation((_path, _timeout, signal?: AbortSignal) =>
@@ -560,9 +579,31 @@ describe('MacOSNativeProviderClient', () => {
     const connectSignal = connectMacOSProviderSocketMock.mock.calls[0]?.[2] as AbortSignal
     providers[0]!.emit('exit', 13, null)
 
-    await expect(call).rejects.toThrow('native macOS helper app exited before connecting: code 13')
+    await expect(call).rejects.toThrow('native macOS helper app launch command failed: code 13')
     expect(connectSignal.aborted).toBe(true)
-    expect(providers[0]!.kill).toHaveBeenCalledWith('SIGTERM')
+    expect(spawnSyncMock).toHaveBeenCalledWith('/usr/bin/pkill', expect.arrayContaining(['-f']), {
+      stdio: 'ignore'
+    })
+  })
+
+  it('keeps waiting for the socket when the launch command exits cleanly', async () => {
+    const { MacOSNativeProviderClient } = await loadClientModule()
+    const client = new MacOSNativeProviderClient()
+    connectMacOSProviderSocketMock.mockImplementation(() => new Promise(() => {}))
+
+    const call = client.capabilities()
+    await vi.waitFor(() => expect(providers).toHaveLength(1))
+    // Why: `open` always exits 0 once LaunchServices owns the app, so this must
+    // not be mistaken for the helper dying before it connected.
+    providers[0]!.emit('exit', 0, null)
+    await vi.waitFor(() => expect(connectMacOSProviderSocketMock).toHaveBeenCalledTimes(1))
+
+    let settled = false
+    void call.catch(() => {
+      settled = true
+    })
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(settled).toBe(false)
   })
 
   it('escalates to SIGKILL when a helper ignores terminate and SIGTERM', async () => {

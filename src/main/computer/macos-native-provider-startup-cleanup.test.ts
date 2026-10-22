@@ -6,12 +6,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MacOSProviderProcessOwner } from './macos-native-provider-process-reaping'
 import { startMacOSNativeProviderSocket } from './macos-native-provider-transport'
 
-const { connectMock, spawnMock } = vi.hoisted(() => ({
+const { connectMock, spawnMock, spawnSyncMock } = vi.hoisted(() => ({
   connectMock: vi.fn(),
-  spawnMock: vi.fn()
+  spawnMock: vi.fn(),
+  // Why: the LaunchServices failure path stops the helper with pkill.
+  spawnSyncMock: vi.fn(() => ({ status: 1 }))
 }))
 
-vi.mock('node:child_process', () => ({ spawn: spawnMock }))
+vi.mock('node:child_process', () => ({ spawn: spawnMock, spawnSync: spawnSyncMock }))
 vi.mock('./macos-native-provider-socket', () => ({
   connectMacOSProviderSocket: connectMock
 }))
@@ -58,7 +60,7 @@ describe('superseded macOS provider startup cleanup', () => {
       let current = true
       const owner = new MacOSProviderProcessOwner()
       const startup = startMacOSNativeProviderSocket({
-        helperExecutablePath: 'fixture-provider',
+        helperAppPath: '/Applications/Fixture Helper.app',
         isCurrent: () => current,
         providerProcess: owner
       })
@@ -73,8 +75,10 @@ describe('superseded macOS provider startup cleanup', () => {
       current = false
       owner.reap()
       if (failure === 'provider exit') {
-        provider.exitCode = 0
-        provider.emit('exit', 0, null)
+        // Why: the LaunchServices launch reads a non-zero exit as the launch
+        // command failing — a clean exit is handover, not a failure.
+        provider.exitCode = 1
+        provider.emit('exit', 1, null)
       } else {
         rejectConnection(new Error('socket did not open'))
       }

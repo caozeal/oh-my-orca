@@ -37,6 +37,7 @@ describe('OpenCode status plugin module contract', () => {
   const ENV_KEYS = [
     'ORCA_OPENCODE_PLUGIN_API',
     'ORCA_PANE_KEY',
+    'ORCA_OPENCODE_AGENT',
     'ORCA_AGENT_HOOK_ENDPOINT',
     'ORCA_AGENT_HOOK_PORT',
     'ORCA_AGENT_HOOK_TOKEN'
@@ -59,6 +60,10 @@ describe('OpenCode status plugin module contract', () => {
     delete process.env.ORCA_OPENCODE_PLUGIN_API
     delete process.env.ORCA_OPENCODE_AGENT
     delete process.env.ORCA_AGENT_HOOK_ENDPOINT
+    // Why: the agent guard short-circuits the factory when it disagrees with the
+    // source under test; an inherited value from an Orca-launched shell silently
+    // turns hooks.event into undefined for the other source's cases.
+    delete process.env.ORCA_OPENCODE_AGENT
     process.env.ORCA_AGENT_HOOK_PORT = '59999'
     process.env.ORCA_AGENT_HOOK_TOKEN = 'test-token'
   })
